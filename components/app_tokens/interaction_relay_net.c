@@ -759,7 +759,11 @@ void tokens_interaction_relay_net_start(void) {
     return;
   }
 #endif
-  if (xTaskCreate(relay_task, "interaction-relay", 10 * 1024, NULL, 4,
+  /* Task names are capped at CONFIG_FREERTOS_MAX_TASK_NAME_LEN - 1 (15)
+   * characters; "interaction-relay" (17) was silently truncated at creation
+   * and then tripped xTaskGetHandle's assert in the heap probe (2026-08-27
+   * boot loop). Keep every task name under the cap. */
+  if (xTaskCreate(relay_task, "interact-relay", 10 * 1024, NULL, 4,
                   NULL) != pdPASS) {
     atomic_fetch_add(&s_failures, 1u);
     atomic_store(&s_started, false);

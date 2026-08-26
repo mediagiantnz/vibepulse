@@ -572,7 +572,12 @@ static void tick_cb(lv_timer_t *t) {
    * NO_MEM (sett vid första flashen 2026-08-06: TLS-hämtning + omritning
    * sammanföll och panelen tystnade permanent). Largest block är siffran
    * som avgör — fragmentering syns inte i totalsumman. */
-  static int heap_probe;
+  /* The FIRST probe runs at ~4 s, inside the boot-health gate's 8 s
+   * minimum uptime, on purpose: the probe is code that can crash (it did,
+   * 2026-08-27, an xTaskGetHandle assert), and a crash before the gate's
+   * verdict rolls the image back, while a crash after it leaves a VALID
+   * image panicking every ten seconds with no way home but USB. */
+  static int heap_probe = 60;
   if (++heap_probe >= 100) {
     heap_probe = 0;
     unsigned dma_largest = (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
@@ -598,7 +603,7 @@ static void tick_cb(lv_timer_t *t) {
      * gång per tio sekunder — billigt nog. */
     static const char *const probed_tasks[] = {
       "tokens", "max-tracker", "agent-status", "github", "needs-you-net",
-      "interaction-relay", "wifi-signal", "rotation", "boot-health",
+      "interact-relay", "wifi-signal", "rotation", "boot-health",
       "torget-net", "lvgl",
     };
     char stacks[200];
@@ -606,7 +611,16 @@ static void tick_cb(lv_timer_t *t) {
     for (size_t i = 0;
          i < sizeof probed_tasks / sizeof probed_tasks[0] &&
          used < sizeof stacks; i++) {
-      TaskHandle_t handle = xTaskGetHandle(probed_tasks[i]);
+      /* xTaskGetHandle ASSERTS (and reboots the panel) on a name of
+       * CONFIG_FREERTOS_MAX_TASK_NAME_LEN characters or more; FreeRTOS
+       * also stores created names truncated to that cap, so the lookup
+       * must use the same spelling. The 2026-08-27 boot loop was exactly
+       * this: "interaction-relay" (17) in this list, VALID image, panic
+       * every ten seconds. Truncate here so a future long name degrades to
+       * a wrong "-" in a log line instead of a dead panel. */
+      char query[CONFIG_FREERTOS_MAX_TASK_NAME_LEN];
+      snprintf(query, sizeof query, "%s", probed_tasks[i]);
+      TaskHandle_t handle = xTaskGetHandle(query);
       int written = handle
           ? snprintf(stacks + used, sizeof stacks - used, "%s%s=%u",
                      i ? " " : "", probed_tasks[i],

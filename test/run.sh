@@ -280,6 +280,7 @@ cc -std=c11 -Wall -Wextra -Werror -O1 \
 "$PYTHON_BIN" test_interaction_relay_net_source.py
 "$PYTHON_BIN" test_vibepulse_codex_plugin.py
 "$PYTHON_BIN" test_cjson_nesting_wiring.py
+"$PYTHON_BIN" test_task_names_wiring.py
 
 cd ..
 "$PYTHON_BIN" -m unittest tools.agent_assets.test_build_agent_images -v

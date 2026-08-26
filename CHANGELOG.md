@@ -13,6 +13,14 @@ both interaction tokens (see "Changed", relays).
 
 ### Fixed
 
+- **Boot loop from the stack probe (2026-08-27, never released).** The
+  ten-second stack-high-water probe asked `xTaskGetHandle` for
+  "interaction-relay", a name longer than FreeRTOS's 15-character cap, and
+  the assert rebooted a panel the boot-health gate had already blessed. The
+  task is now "interact-relay", the probe truncates every name before the
+  lookup, its first run happens inside the gate's 8 s minimum so a crashing
+  probe rolls back instead of sticking, and a wiring test pins all task
+  names under the cap.
 - **The Value page in a fresh clone.** With the GitHub page off (the default)
   the Value tile was created one column past the end of the tile array, so
   the panel showed an empty black column before it and the pager never

@@ -455,3 +455,18 @@ reason code arrived first. **Guards:** `tg_wifi_join_next_status()` consults the
 reason only while CONNECTING and promotes to CONNECTED on an IP regardless; the
 slots test walks eleven orderings. **Watch for:** any disconnect-reason branch
 that can outrank a later positive signal.
+
+## 2026-08-27 · A VALID image can still boot-loop, and the gate cannot save it
+
+The review batch added a ten-second stack probe that looked tasks up with
+`xTaskGetHandle(name)`. FreeRTOS caps task names at
+`CONFIG_FREERTOS_MAX_TASK_NAME_LEN - 1` (15) and ASSERTS on a longer query;
+"interaction-relay" is 17. The probe first ran at 10 s, after the
+boot-health gate's 8 s minimum had already blessed the image, so the panel
+was VALID and panicked every ten seconds with no rollback possible; only the
+USB serial log named the assert. **The rule:** anything periodic that can
+crash must run once inside the gate's minimum uptime, and every task name
+must fit the cap. **Guards:** `test_task_names_wiring.py` pins name lengths,
+the probe's truncation and the pre-advanced first probe (~4 s); the probe
+now truncates before asking. **Watch for:** new task names, and any new
+periodic diagnostic that first fires after 8 s.
