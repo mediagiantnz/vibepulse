@@ -228,6 +228,65 @@ static void test_join_submissions_retry_and_explain_failures(void) {
         tg_wifi_disconnect_status(8) == TG_WIFI_JOIN_RETRY_CONNECTION);
 }
 
+static void test_ip_proves_the_trial_whatever_reason_came_first(void) {
+  /* The 2026-08-26 case: marginal signal, reason 15 on the first attempt,
+   * association on the retry. The IP must win and the network be kept. */
+  check("reason 15 while connecting reports a password retry",
+        tg_wifi_join_next_status(TG_WIFI_JOIN_CONNECTING, true, false, false,
+                                 15) == TG_WIFI_JOIN_RETRY_PASSWORD);
+  check("an IP after that retry status still connects",
+        tg_wifi_join_next_status(TG_WIFI_JOIN_RETRY_PASSWORD, true, false,
+                                 true, 15) == TG_WIFI_JOIN_CONNECTED);
+  check("an IP while connecting connects",
+        tg_wifi_join_next_status(TG_WIFI_JOIN_CONNECTING, true, false, true,
+                                 0) == TG_WIFI_JOIN_CONNECTED);
+  check("an IP outranks a not-found reason too",
+        tg_wifi_join_next_status(TG_WIFI_JOIN_RETRY_NOT_FOUND, true, false,
+                                 true, 201) == TG_WIFI_JOIN_CONNECTED);
+
+  /* The IP sample taken before the trial was applied proves nothing. */
+  check("an IP sampled before the trial applied is ignored",
+        tg_wifi_join_next_status(TG_WIFI_JOIN_CONNECTING, true, true, true,
+                                 0) == TG_WIFI_JOIN_CONNECTING);
+  /* A trial that never reached the radio, or was abandoned, cannot be
+   * proven by an IP: that IP belongs to a saved network. */
+  check("an IP with no live trial is not the trial's",
+        tg_wifi_join_next_status(TG_WIFI_JOIN_RETRY_CONNECTION, false, false,
+                                 true, 0) == TG_WIFI_JOIN_RETRY_CONNECTION);
+  check("a dead trial ignores reason codes as well",
+        tg_wifi_join_next_status(TG_WIFI_JOIN_CONNECTING, false, false, false,
+                                 15) == TG_WIFI_JOIN_CONNECTING);
+
+  /* Reason codes only move a CONNECTING trial, never a decided one. */
+  check("no reason yet keeps connecting",
+        tg_wifi_join_next_status(TG_WIFI_JOIN_CONNECTING, true, false, false,
+                                 0) == TG_WIFI_JOIN_CONNECTING);
+  check("a retry status is not rewritten by a later reason",
+        tg_wifi_join_next_status(TG_WIFI_JOIN_RETRY_PASSWORD, true, false,
+                                 false, 201) == TG_WIFI_JOIN_RETRY_PASSWORD);
+  check("connected is terminal",
+        tg_wifi_join_next_status(TG_WIFI_JOIN_CONNECTED, true, false, false,
+                                 15) == TG_WIFI_JOIN_CONNECTED);
+  check("idle is terminal",
+        tg_wifi_join_next_status(TG_WIFI_JOIN_IDLE, true, false, true, 0) ==
+            TG_WIFI_JOIN_IDLE);
+}
+
+static void test_only_a_held_window_may_use_the_token_psk(void) {
+  /* A KEY3 hold is a person at the panel: the token-derived PSK that
+   * tools/wifi-here.sh can compute is allowed. A window that opened itself
+   * can be provoked from outside (deauth flood -> 90 s without IP), so it
+   * must never expose the long-lived derivation. */
+  check("hold with a token derives from the token",
+        tg_wifi_ap_psk_source(true, true) == TG_WIFI_PSK_TOKEN_DERIVED);
+  check("an automatic window with a token is random",
+        tg_wifi_ap_psk_source(false, true) == TG_WIFI_PSK_RANDOM);
+  check("hold without a token is random",
+        tg_wifi_ap_psk_source(true, false) == TG_WIFI_PSK_RANDOM);
+  check("automatic without a token is random",
+        tg_wifi_ap_psk_source(false, false) == TG_WIFI_PSK_RANDOM);
+}
+
 static void test_dma_gates_protect_the_flush(void) {
   const size_t flush = 12 * 480 * 2; /* 11 520 — panelflushens block */
   const size_t open_floor = TG_WIFI_SETUP_DMA_OPEN_FACTOR * flush +
@@ -283,6 +342,8 @@ int main(void) {
   test_setup_window_closes();
   test_setup_phase_owns_key3_without_accidental_release();
   test_join_submissions_retry_and_explain_failures();
+  test_ip_proves_the_trial_whatever_reason_came_first();
+  test_only_a_held_window_may_use_the_token_psk();
 
   if (failures == 0) {
     printf("OK: all WiFi slot/window policy tests pass\n");

@@ -2,21 +2,12 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
 
-void usage_presenter_format_agent_metadata(const tk_agent_status *agent,
-                                           char *out, size_t capacity) {
-  if (!out || capacity == 0) return;
-  out[0] = '\0';
-  if (!agent) return;
-  if (agent->has_model && agent->has_effort) {
-    snprintf(out, capacity, "%s · %s", agent->model, agent->effort);
-  } else if (agent->has_model) {
-    snprintf(out, capacity, "%s", agent->model);
-  } else if (agent->has_effort) {
-    snprintf(out, capacity, "%s", agent->effort);
-  }
-}
+/* The model-week page's label when the service has not named the model.
+ * Generic on purpose: naming a model here would be inventing which one the
+ * week belongs to, and the service already sends the real label whenever
+ * it knows it (claudeModelWeekLabel). */
+#define USAGE_MODEL_WEEK_FALLBACK_LABEL "MODEL \xC2\xB7 WEEK"
 
 const char *usage_presenter_quota_status_text(int has_data, int stale,
                                               const char *live_context) {
@@ -78,38 +69,6 @@ static void build_card(usage_card_view *out, usage_card_kind kind,
   }
 }
 
-static void build_hero_quota(const tk_tokens *tokens, usage_provider provider,
-                             usage_card_view *out) {
-  if (provider == USAGE_PROVIDER_CODEX) {
-    build_card(out, USAGE_CARD_ALL_WEEK, "WEEKLY", &tokens->codex_week);
-    return;
-  }
-  if (tokens->has_claude_model_week_label &&
-      tokens->claude_model_week_label[0] &&
-      tokens->claude_model_week.has_pct) {
-    build_card(out, USAGE_CARD_MODEL_WEEK, tokens->claude_model_week_label,
-               &tokens->claude_model_week);
-    return;
-  }
-  build_card(out, USAGE_CARD_ALL_WEEK,
-             tokens->claude_week.has_pct ? "WEEKLY · ALL MODELS"
-                                         : "WEEKLY",
-             &tokens->claude_week);
-}
-
-void usage_presenter_build_hero(const tk_tokens *tokens,
-                                usage_provider provider,
-                                usage_hero_view *out) {
-  tk_tokens empty = {0};
-  if (!out) return;
-  if (!tokens) tokens = &empty;
-  memset(out, 0, sizeof *out);
-  out->provider = provider;
-  snprintf(out->provider_label, sizeof out->provider_label, "%s",
-           provider == USAGE_PROVIDER_CODEX ? "CODEX" : "CLAUDE");
-  build_hero_quota(tokens, provider, &out->quota);
-}
-
 void usage_presenter_build_quota_page(const tk_tokens *tokens,
                                       usage_quota_scope scope,
                                       usage_quota_page_view *out) {
@@ -125,7 +84,7 @@ void usage_presenter_build_quota_page(const tk_tokens *tokens,
                  tokens->has_claude_model_week_label &&
                          tokens->claude_model_week_label[0]
                      ? tokens->claude_model_week_label
-                     : "FABLE · WEEK",
+                     : USAGE_MODEL_WEEK_FALLBACK_LABEL,
                  &tokens->claude_model_week);
       break;
     case USAGE_QUOTA_CLAUDE_ALL:
@@ -142,54 +101,67 @@ void usage_presenter_build_quota_page(const tk_tokens *tokens,
   }
 }
 
-void usage_presenter_build_claude_details(
-    const tk_tokens *tokens, usage_detail_page_view *out) {
-  tk_tokens empty = {0};
-  if (!out) return;
-  if (!tokens) tokens = &empty;
-  memset(out, 0, sizeof *out);
-  build_card(&out->rows[0], USAGE_CARD_MODEL_WEEK,
-             tokens->has_claude_model_week_label &&
-                     tokens->claude_model_week_label[0]
-                 ? tokens->claude_model_week_label
-                 : "FABLE · WEEK",
-             &tokens->claude_model_week);
-  build_card(&out->rows[1], USAGE_CARD_ALL_WEEK, "ALL MODELS",
-             &tokens->claude_week);
-  out->row_count = 2;
-}
-
-void usage_presenter_build_overview(
-    const tk_tokens *tokens, usage_overview_page_view *out) {
-  usage_hero_view hero = {0};
-  if (!out) return;
-  memset(out, 0, sizeof *out);
-  usage_presenter_build_hero(tokens, USAGE_PROVIDER_CLAUDE, &hero);
-  out->rows[0].provider = hero.provider;
-  out->rows[0].quota = hero.quota;
-  usage_presenter_build_hero(tokens, USAGE_PROVIDER_CODEX, &hero);
-  out->rows[1].provider = hero.provider;
-  out->rows[1].quota = hero.quota;
-  out->row_count = 2;
-}
-
 static void unavailable_forecast(usage_forecast_row_view *out) {
   snprintf(out->headline, sizeof out->headline, "UNAVAILABLE");
   snprintf(out->detail, sizeof out->detail, "NO RELIABLE FORECAST");
 }
 
-static int format_exhaustion_time(const tk_forecast *forecast, char *out,
-                                  size_t capacity) {
-  if (!forecast->has_at_epoch) return 0;
-  time_t timestamp = (time_t)forecast->at_epoch;
-  struct tm *local = localtime(&timestamp);
-  if (!local || local->tm_wday < 0 || local->tm_wday > 6) return 0;
+/* "RUNS OUT SAT 07:00" in the HOST's local time. The device has no time
+ * zone (SNTP gives it UTC and nothing else), so localtime() here was UTC
+ * dressed as local; the host's own offset now travels in the payload as
+ * tzOffsetMin. Pure arithmetic on the epoch, no libc calendar: the same
+ * bytes on the Mac, in CI and on the panel, whatever TZ they run under.
+ * 1970-01-01 was a Thursday. */
+static int format_exhaustion_clock(int64_t at_epoch, int tz_offset_min,
+                                   char *out, size_t capacity) {
+  int64_t local = at_epoch + (int64_t)tz_offset_min * 60;
+  if (local < 0) return 0;
+  int64_t days = local / 86400;
+  int64_t second_of_day = local % 86400;
   static const char *weekdays[] = {
       "SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT",
   };
   snprintf(out, capacity, "RUNS OUT %s %02d:%02d",
-           weekdays[local->tm_wday], local->tm_hour, local->tm_min);
+           weekdays[(4 + days) % 7], (int)(second_of_day / 3600),
+           (int)((second_of_day % 3600) / 60));
   return 1;
+}
+
+/* Without a known offset the honest form is relative, and the payload
+ * already carries everything needed: the week resets in reset_min minutes
+ * and the forecast runs out offset_min minutes before that. */
+static int format_exhaustion_relative(const tk_limit *week,
+                                      const tk_forecast *forecast,
+                                      char *out, size_t capacity) {
+  if (!week->has_reset) {
+    snprintf(out, capacity, "RUNS OUT BEFORE RESET");
+    return 1;
+  }
+  int64_t left = (int64_t)week->reset_min + (int64_t)forecast->offset_min;
+  if (left <= 0) {
+    snprintf(out, capacity, "RUNS OUT NOW");
+  } else if (left >= 24 * 60) {
+    snprintf(out, capacity, "RUNS OUT IN %lldD %lldH",
+             (long long)(left / (24 * 60)), (long long)((left / 60) % 24));
+  } else if (left >= 60) {
+    snprintf(out, capacity, "RUNS OUT IN %lldH %02lldM",
+             (long long)(left / 60), (long long)(left % 60));
+  } else {
+    snprintf(out, capacity, "RUNS OUT IN %lldM", (long long)left);
+  }
+  return 1;
+}
+
+static int format_exhaustion_time(const tk_limit *week,
+                                  const tk_forecast *forecast,
+                                  int has_tz_offset_min, int tz_offset_min,
+                                  char *out, size_t capacity) {
+  if (!forecast->has_at_epoch) return 0;
+  if (has_tz_offset_min) {
+    return format_exhaustion_clock(forecast->at_epoch, tz_offset_min, out,
+                                   capacity);
+  }
+  return format_exhaustion_relative(week, forecast, out, capacity);
 }
 
 static void format_early(int64_t magnitude, char *out, size_t capacity) {
@@ -208,7 +180,8 @@ static void format_early(int64_t magnitude, char *out, size_t capacity) {
 static void build_forecast_row(usage_forecast_row_view *out,
                                usage_provider provider, const char *label,
                                const tk_limit *week,
-                               const tk_forecast *forecast) {
+                               const tk_forecast *forecast,
+                               int has_tz_offset_min, int tz_offset_min) {
   memset(out, 0, sizeof *out);
   out->provider = provider;
   snprintf(out->label, sizeof out->label, "%s", label);
@@ -251,12 +224,15 @@ static void build_forecast_row(usage_forecast_row_view *out,
         snprintf(out->detail, sizeof out->detail, "RUNS OUT AT RESET");
         break;
       }
-      if (!format_exhaustion_time(forecast, out->detail,
+      if (!format_exhaustion_time(week, forecast, has_tz_offset_min,
+                                  tz_offset_min, out->detail,
                                   sizeof out->detail)) {
         unavailable_forecast(out);
         break;
       }
-      format_early(-forecast->offset_min, out->headline,
+      /* Widen before negating: the parser bounds offset_min to a year, and
+       * the int64 keeps INT_MIN impossible even if that bound ever slips. */
+      format_early(-(int64_t)forecast->offset_min, out->headline,
                    sizeof out->headline);
       break;
     case TK_FORECAST_UNAVAILABLE:
@@ -401,9 +377,11 @@ void usage_presenter_build_forecasts(const tk_tokens *tokens,
   memset(out, 0, sizeof *out);
   build_forecast_row(&out->rows[0], USAGE_PROVIDER_CLAUDE,
                      "CLAUDE · ALL MODELS", &tokens->claude_week,
-                     &tokens->claude_forecast);
+                     &tokens->claude_forecast, tokens->has_tz_offset_min,
+                     tokens->tz_offset_min);
   build_forecast_row(&out->rows[1], USAGE_PROVIDER_CODEX,
                      "CODEX · WEEKLY", &tokens->codex_week,
-                     &tokens->codex_forecast);
+                     &tokens->codex_forecast, tokens->has_tz_offset_min,
+                     tokens->tz_offset_min);
   out->row_count = 2;
 }

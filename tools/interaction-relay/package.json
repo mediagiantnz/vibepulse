@@ -10,9 +10,9 @@
     "types": "wrangler types",
     "types:check": "wrangler types --check",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run && node --test deploy.test.mjs",
     "deploy:dry": "wrangler deploy --dry-run",
-    "deploy": "wrangler deploy"
+    "deploy": "node deploy.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.22.0",

@@ -58,8 +58,8 @@ PAGER_ROW_Y = 458  # PAGER_Y (456) + 2: inside the 6px-tall dot row
 
 def _screen_views():
     """The tile count the SIMULATOR renders. The header now defines
-    TK_USAGE_SCREEN_VIEWS as an expression (six base tiles +
-    TK_GITHUB_SCREEN_ENABLED + the always-present value tile) rather than a
+    TK_USAGE_SCREEN_VIEWS as an expression (seven fixed tiles +
+    TK_GITHUB_SCREEN_ENABLED for the optional last tile) rather than a
     bare integer, and the simulator opts GitHub in via sim/CMakeLists.txt.
     Read that toggle and evaluate the header's own expression so this stays
     in lockstep with both files instead of hard-coding 8."""
@@ -1058,7 +1058,7 @@ class VibePulseVisualLandmarkTests(unittest.TestCase):
 
     def test_pager_shows_one_dot_per_view(self):
         # The simulator opts into GitHub, so the layout is the full eight
-        # tiles (six base + github + value) and create_pager draws one dot
+        # tiles (seven fixed + github last) and create_pager draws one dot
         # per view, the active one 18px wide and the rest 6px, all on one
         # pixel row with nothing else sharing it — so counting horizontal
         # runs of non-black pixels on that row is an exact dot count and
@@ -1070,7 +1070,7 @@ class VibePulseVisualLandmarkTests(unittest.TestCase):
             ("torget-vibepulse-tracker-codex-full.bmp", 5),        # VIEW_TRACKER_CODEX
             ("torget-vibepulse-tracker-empty.bmp", 5),             # view unchanged
             ("torget-vibepulse-tracker-stale.bmp", 5),             # view unchanged
-            ("torget-vibepulse-value-both.bmp", 7),               # VIEW_VALUE (last tile)
+            ("torget-vibepulse-value-both.bmp", 6),               # VIEW_VALUE (last fixed tile)
         )
         for name, active_index in cases:
             with self.subTest(name=name):

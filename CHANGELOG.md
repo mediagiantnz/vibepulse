@@ -5,7 +5,107 @@ on the [releases page](https://github.com/niclasvestlund-YT/vibepulse/releases).
 
 ## Unreleased
 
-No user-facing changes yet.
+A whole-project review (2026-08-26) and the fixes that came out of it. No new
+feature; one fresh-clone display bug, a batch of security hardening and a
+number of honesty fixes. Operators who deployed either relay before this
+change should redeploy with the new config and rotate the relay secret and
+both interaction tokens (see "Changed", relays).
+
+### Fixed
+
+- **The Value page in a fresh clone.** With the GitHub page off (the default)
+  the Value tile was created one column past the end of the tile array, so
+  the panel showed an empty black column before it and the pager never
+  highlighted it. Value is now the fixed sixth page and the optional GitHub
+  page is always the last one; a compile-time assert keeps the order honest.
+- **"RUNS OUT SUN 14:30" was UTC.** The panel has no timezone, so the
+  exhaustion clock printed UTC as if it were local time. The tokenserver now
+  sends `tzOffsetMin` (the host's UTC offset in minutes) and the panel renders
+  host-local time; when the offset is unknown it shows a relative time
+  ("RUNS OUT IN 1D 3H"), never a wrong clock.
+- **"ON IT" only when the answer actually left.** A Needs You verdict that
+  could not be queued (no device key, full send queue, capture failure) used
+  to dismiss the takeover and play the payoff anyway. The takeover now stays
+  up with "NOT SENT · ANSWER AT YOUR DESK" and only LEAVE IT; a build with no
+  send channel offers LEAVE IT only.
+- **Missing model label.** A model-week window without a label read
+  "FABLE · WEEK"; it now reads "MODEL · WEEK".
+- **Max Tracker and GitHub pages go stale on their own feed** instead of
+  showing LIVE forever when only their endpoint dies (OBS-09, partial: the
+  agent feed's copy is still pending an AMOLED review).
+- **A forgotten network after a marginal join.** A 4-way-handshake timeout
+  on a weak link was treated as WRONG PASSWORD even when the trial then got
+  an IP, so the network was never saved. An IP on the applied trial now
+  counts as proof whatever reason code arrived first.
+- **Unsynced clock on the panel.** `time(NULL) <= 0` never fires on an
+  ESP32 before SNTP, so relay expiry was inert and direct verdicts could
+  carry a bogus timestamp. Both paths now gate on a plausible wall clock.
+- **Tokenserver: one malformed transcript row froze the month's totals.**
+  Hostile or truncated rows in `~/.claude/projects` are skipped instead of
+  aborting the whole recompute.
+- **Tokenserver: idle connections could exhaust the worker pool.** A 15 s
+  socket timeout on request reads plus TCP keepalive; 32 silent peers no
+  longer turn every poll into a 503.
+- **Tokenserver: DST-safe month and day boundaries** (the first hour of an
+  April month was dropped on NZ hosts), a bounded 15-minute freshness window
+  for the Codex rollout fallback (older observations are served `stale:true`
+  and history samples are stamped at observation time), `max-tracker.json`
+  saved only when something changed, stale inode watermarks pruned, and a
+  clean shutdown with a final flush on SIGTERM/SIGBREAK.
+- **Windows setup.** `tools/vibepulse_setup.py doctor/install` now verifies
+  Codex ownership correctly on Windows (CRLF probe output, `\\?\` paths,
+  root-only marketplace rows) and retains up to 1 MiB of
+  `codex plugin list --json` instead of 16 KiB; the Codex hook scripts emit
+  UTF-8 on Windows instead of cp1252. VibePulse Studio runs on Windows.
+- **Relay merge** clamps publisher clocks to receipt time and copies a
+  pool's winner as a whole, so a fast clock or an older tokenserver can no
+  longer mix fields from two machines.
+
+### Changed
+
+- **OTA upload proof.** The sender no longer sends the OTA token over the
+  LAN. It sends the image's SHA-256 and `X-VibePulse-Auth`, an HMAC-SHA256 of
+  that digest keyed with the token; the device checks the proof before
+  accepting bytes and re-checks the streamed digest against it before
+  activating, both in constant time. Script and firmware are a matched pair:
+  update the panel over USB (or with the previous `ota-flash.sh`) once. While
+  the running image is still unverified the device answers 409 and
+  `ota-flash.sh` waits for `pending_verify:false`; the script now exits
+  non-zero on anything but 202. `openssl` is required on the Mac.
+- **Setup-AP password.** Only a window opened with the KEY3 hold uses the
+  token-derived password; a window that opens by itself after 90 s without an
+  IP gets a fresh random password shown only on the glass, so a deauth flood
+  can no longer be turned into a known-password setup window. `docs/wifi.md`
+  now states the guarantee honestly.
+- **Relays: platform invocation logs are off.** Cloudflare Workers Logs were
+  retaining request URLs and headers for seven days, which for the numbers
+  relay is the secret URL and for the interaction relay both bearer tokens.
+  Both configs and the deploy guard now require `invocation_logs: false`.
+  Redeploy and rotate `RELAY_SECRET` and both interaction tokens. The numbers
+  relay also compares the secret in constant time, sends
+  `Cache-Control: no-store`, measures bodies in bytes and refuses documents
+  that are not the numbers shape; a ninth publisher evicts the quietest name
+  instead of being refused forever. The interaction relay's `npm run deploy`
+  is now a guard that refuses the placeholder mailbox id.
+- **Tokenserver GET host guard.** `GET` requests whose `Host` is not an IP
+  literal, `localhost` or a `.local` name get 421, closing DNS-rebinding
+  reads of agent status from a browser on the LAN. The panel's compiled-in
+  Bonjour name is unaffected.
+- **Parsers reject deep JSON.** cJSON on the panel is compiled with a
+  nesting limit of 16 (a 20-deep body used to recurse on a 6 KB stack);
+  the tokenserver bounds request bodies to 32 levels.
+- `/api/tokens` body budget on the panel raised from 2048 to 3072 bytes; the
+  real worst-case payload (1571 B) had crossed the 75 % margin unnoticed,
+  and the capacity gate now diffs the live snapshot's key set.
+- CI runs the Codex plugin and setup-script suite on Windows and macOS as
+  well as Ubuntu; studio browser-contract tests run under Node where JXA is
+  absent and fail rather than skip on CI.
+
+### Removed
+
+- Dead firmware code kept alive only by its tests (the removed monitor
+  view's policy helpers, `agent_usage.c`, unused presenter builders) and the
+  inert keep-alive fields on the agent-status client.
 
 ## v0.7.0 — 2026-08-23
 

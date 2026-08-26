@@ -24,6 +24,11 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".agents/plugins/plugins/vibepulse/scripts"
 MAX_HOOK_INPUT = 64 * 1024
+# The setup script resolves every executable before it plans, so the argv
+# it emits is platform-shaped ("/codex" on POSIX, "C:\codex" on Windows).
+# Expectations are derived from the same input the code receives.
+CODEX = Path("/codex")
+CODEX_ARGV0 = str(CODEX.resolve())
 
 PERMISSION = {
     "hook_event_name": "PermissionRequest",
@@ -113,9 +118,22 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
 
+class _QuietServer(ThreadingHTTPServer):
+    """The clients under test abandon connections on purpose (deadlines,
+    drip feeds); the resulting server-side write errors are expected and
+    only clutter the run on Windows, where they surface as WinError 10053."""
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (ConnectionAbortedError,
+                                          ConnectionResetError,
+                                          BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
+
+
 class LocalServer:
     def __init__(self, **behavior):
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.httpd = _QuietServer(("127.0.0.1", 0), _Handler)
         self.httpd.behavior = behavior
         self.httpd.requests = []
         self.httpd.request_times = []
@@ -1346,22 +1364,28 @@ class SetupPlanTests(unittest.TestCase):
 
     def test_install_plan_is_exact_and_paths_with_spaces_stay_one_argv(self):
         setup = load_setup()
+        repo = Path("/repo with spaces")
+        python = Path("/python with spaces")
         commands = setup.plan_codex_install(
-            repo_root=Path("/repo with spaces"),
-            python=Path("/python with spaces"), codex=Path("/codex"),
+            repo_root=repo, python=python, codex=CODEX,
             marketplace_name="torget")
+        repo_arg = str(repo.resolve())
+        python_arg = str(python.resolve())
+        mcp_server = str(repo.resolve() / ".agents" / "plugins" / "plugins" /
+                         "vibepulse" / "scripts" / "mcp_server.py")
+        self.assertIn(" ", repo_arg)
+        self.assertIn(" ", python_arg)
         self.assertEqual(commands, [
-            ["/codex", "plugin", "marketplace", "add",
-             "/repo with spaces"],
-            ["/codex", "plugin", "add", "vibepulse@torget"],
-            ["/codex", "mcp", "remove", "vibepulse"],
-            ["/codex", "mcp", "add", "vibepulse", "--",
-             "/python with spaces",
-             "/repo with spaces/.agents/plugins/plugins/vibepulse/scripts/"
-             "mcp_server.py"],
+            [CODEX_ARGV0, "plugin", "marketplace", "add", repo_arg],
+            [CODEX_ARGV0, "plugin", "add", "vibepulse@torget"],
+            [CODEX_ARGV0, "mcp", "remove", "vibepulse"],
+            [CODEX_ARGV0, "mcp", "add", "vibepulse", "--", python_arg,
+             mcp_server],
         ])
         self.assertNotEqual(
-            commands[0][-1], "/repo with spaces/.agents/plugins")
+            commands[0][-1], str(repo.resolve() / ".agents" / "plugins"))
+        self.assertTrue(all(isinstance(word, str) and word
+                            for command in commands for word in command))
 
     def test_provider_choices_and_detail_are_separate_explicit_opt_ins(self):
         setup = load_setup()
@@ -1521,7 +1545,10 @@ class RelaySetupTests(unittest.TestCase):
         token = root / "home/.vibepulse-interaction-relay-token"
         secrets = root / "repo/secrets.h"
         service = root / "repo/tools/interaction-relay"
-        wrangler = service / "node_modules/.bin/wrangler"
+        # npm installs a .cmd shim on Windows; the setup script looks for
+        # exactly the shim its platform would get, so the fixture does too.
+        wrangler = service / "node_modules/.bin" / (
+            "wrangler.cmd" if os.name == "nt" else "wrangler")
         wrangler.parent.mkdir(parents=True)
         wrangler.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
         wrangler.chmod(0o700)
@@ -2071,12 +2098,12 @@ class RelaySetupTests(unittest.TestCase):
             runner = StatefulCodexRunner()
             self.assertEqual(setup.main(
                 ["uninstall", "codex"], config_path=config,
-                codex=Path("/codex"), run=runner,
+                codex=CODEX, run=runner,
                 stdout=io.StringIO()), 0)
             self.assertEqual([call[0] for call in runner.calls[3:6]], [
-                ["/codex", "mcp", "remove", "vibepulse"],
-                ["/codex", "plugin", "remove", "vibepulse@torget"],
-                ["/codex", "plugin", "marketplace", "remove", "torget"],
+                [CODEX_ARGV0, "mcp", "remove", "vibepulse"],
+                [CODEX_ARGV0, "plugin", "remove", "vibepulse@torget"],
+                [CODEX_ARGV0, "plugin", "marketplace", "remove", "torget"],
             ])
             self.assertEqual(setup.load_config(config), setup.VibePulseConfig(
                 claude_interactions=True, codex_interactions=False,
@@ -2114,10 +2141,10 @@ class RelaySetupTests(unittest.TestCase):
             })
             self.assertEqual(setup.main(
                 ["uninstall", "codex"], config_path=path,
-                codex=Path("/codex"), run=failed,
+                codex=CODEX, run=failed,
                 stdout=io.StringIO()), 1)
             self.assertIn(
-                ["/codex", "plugin", "marketplace", "remove", "torget"],
+                [CODEX_ARGV0, "plugin", "marketplace", "remove", "torget"],
                 [call[0] for call in failed.calls])
             self.assertTrue(setup.load_config(path).codex_interactions)
 
@@ -2259,7 +2286,7 @@ class RelaySetupTests(unittest.TestCase):
             # but a symlink to dash on Debian-family CI runners.
             self.assertEqual(runner.calls[0][0][0:2],
                              [str(Path("/bin/sh").resolve()), "-c"])
-            self.assertEqual(runner.calls[1][0], ["/codex", "--version"])
+            self.assertEqual(runner.calls[1][0], [CODEX_ARGV0, "--version"])
             self.assertTrue(all(call[1]["timeout"] <= 15
                                 and call[1]["shell"] is False
                                 for call in runner.calls))
@@ -2399,7 +2426,10 @@ class RelaySetupTests(unittest.TestCase):
                 '{"installed":NaN,"available":[]}',
                 "[" * 5000 + "]" * 5000,
                 "{",
-                json.dumps(plugin_listing()) + " " * (16 * 1024),
+                # One byte over the retained-output cap: a valid listing
+                # padded past it must be discarded, never trusted.
+                json.dumps(plugin_listing()) +
+                " " * (setup.MAX_COMMAND_OUTPUT_BYTES + 1),
             ]
             path = Path(tmp) / "config.json"
             setup.save_config(path, setup.VibePulseConfig(
@@ -2520,9 +2550,9 @@ class RelaySetupTests(unittest.TestCase):
                           json_result(marketplace_listing())],
         }
         expected_preflight = [
-            ["/codex", "mcp", "list", "--json"],
-            ["/codex", "plugin", "list", "--json"],
-            ["/codex", "plugin", "marketplace", "list", "--json"],
+            [CODEX_ARGV0, "mcp", "list", "--json"],
+            [CODEX_ARGV0, "plugin", "list", "--json"],
+            [CODEX_ARGV0, "plugin", "marketplace", "list", "--json"],
         ]
         with tempfile.TemporaryDirectory() as tmp:
             for label, responses in cases.items():
@@ -2764,16 +2794,29 @@ class RelaySetupTests(unittest.TestCase):
 
     def test_production_process_boundary_drains_caps_utf8_and_recovers(self):
         setup = load_setup()
+        cap = setup.MAX_COMMAND_OUTPUT_BYTES
+        # Buffered writes, not os.write: the whole payload must reach the
+        # pipe regardless of the platform's short-write behaviour.
         noisy = [
             sys.executable, "-c",
-            "import os; b=b'x'*20000; os.write(1,b); os.write(2,b)",
+            f"import sys; b=b'x'*{cap + 1}; sys.stdout.buffer.write(b); "
+            "sys.stderr.buffer.write(b)",
+        ]
+        at_cap = [
+            sys.executable, "-c",
+            f"import sys; sys.stdout.buffer.write(b'x'*{cap})",
         ]
         invalid = [sys.executable, "-c", "import os; os.write(1,b'\\xff')"]
         valid = [sys.executable, "-c", "print('ok')"]
         self.assertIsNone(setup._invoke(noisy, setup._AUTO))
         self.assertIsNone(setup._invoke(invalid, setup._AUTO))
+        retained = setup._invoke(at_cap, setup._AUTO)
+        self.assertIsNotNone(retained)
+        self.assertEqual(len(retained.stdout), cap)
         completed = setup._invoke(valid, setup._AUTO)
         self.assertIsNotNone(completed)
+        # print() emits the platform newline; the boundary normalises it so
+        # exact-string probes compare against one spelling everywhere.
         self.assertEqual(completed.stdout, "ok\n")
         self.assertFalse(any(thread.name.startswith("vibepulse-drain-")
                              for thread in threading.enumerate()))
@@ -3225,13 +3268,14 @@ class RelaySetupTests(unittest.TestCase):
         self.assertGreaterEqual(elapsed, 0.1)
         self.assertLess(elapsed, 1.0)
 
-    def test_process_interrupt_terminates_tree_and_windows_uses_taskkill(self):
+    def test_process_interrupt_terminates_tree_on_both_capture_paths(self):
         setup = load_setup()
 
-        class InterruptProcess:
+        class PollInterrupt:
+            """The raw-pipe path learns of the interrupt while polling."""
             pid = 424242
-            stdout = io.BytesIO()
-            stderr = io.BytesIO()
+            stdout = None
+            stderr = None
 
             def wait(self, timeout=None):
                 return 1
@@ -3239,18 +3283,51 @@ class RelaySetupTests(unittest.TestCase):
             def poll(self):
                 raise KeyboardInterrupt()
 
-        process = InterruptProcess()
-        with mock.patch.object(
-                setup.subprocess, "Popen", return_value=process), \
-                mock.patch.object(setup, "_terminate_process_tree") as stop:
-            with self.assertRaises(KeyboardInterrupt):
-                setup._bounded_process(["/fake/python", "--version"])
-        stop.assert_called_with(process)
-        self.assertFalse(any(thread.name.startswith("vibepulse-drain-")
-                             for thread in threading.enumerate()))
+        class WaitInterrupt:
+            """The reader-thread path learns of it inside wait()."""
+            pid = 424243
 
-        class WindowsProcess:
+            def __init__(self):
+                self.stdout = io.BytesIO()
+                self.stderr = io.BytesIO()
+
+            def wait(self, timeout=None):
+                raise KeyboardInterrupt()
+
+            def poll(self):
+                return None
+
+        # Both capture implementations are exercised directly on every
+        # platform (Popen is the seam); the dispatcher check below proves
+        # the running platform takes the branch it should.
+        cases = (
+            ("raw-pipe", setup._bounded_posix_process, PollInterrupt),
+            ("reader-thread", setup._bounded_thread_process, WaitInterrupt),
+            ("dispatch", setup._bounded_process,
+             PollInterrupt if os.name == "posix" else WaitInterrupt),
+        )
+        for label, capture, factory in cases:
+            with self.subTest(path=label):
+                process = factory()
+                with mock.patch.object(
+                        setup.subprocess, "Popen", return_value=process), \
+                        mock.patch.object(
+                            setup, "_terminate_process_tree") as stop:
+                    with self.assertRaises(KeyboardInterrupt):
+                        capture(["/fake/python", "--version"])
+                stop.assert_called_once_with(process)
+                self.assertFalse(any(
+                    thread.name.startswith("vibepulse-drain-")
+                    for thread in threading.enumerate()))
+
+    def test_terminate_process_tree_uses_killpg_on_posix_and_taskkill_on_windows(self):
+        setup = load_setup()
+
+        class RunningProcess:
             pid = 31337
+
+            def __init__(self):
+                self.killed = 0
 
             def poll(self):
                 return None
@@ -3258,16 +3335,43 @@ class RelaySetupTests(unittest.TestCase):
             def wait(self, timeout=None):
                 return 1
 
-        windows_process = WindowsProcess()
+            def kill(self):
+                self.killed += 1
+
+        process = RunningProcess()
         with mock.patch.object(setup.os, "name", "nt"), \
                 mock.patch.object(setup.subprocess, "run") as taskkill:
-            setup._terminate_process_tree(windows_process)
+            setup._terminate_process_tree(process)
         taskkill.assert_called_once()
         argv, kwargs = taskkill.call_args
         self.assertEqual(argv[0], [
             "taskkill", "/PID", "31337", "/T", "/F"])
         self.assertFalse(kwargs["shell"])
         self.assertLessEqual(kwargs["timeout"], 2)
+        self.assertEqual(process.killed, 0)
+
+        # POSIX kills the whole session with SIGKILL and never shells out;
+        # patched with create=True so the branch is provable on Windows,
+        # where os.killpg and signal.SIGKILL do not exist.
+        process = RunningProcess()
+        with mock.patch.object(setup.os, "name", "posix"), \
+                mock.patch.object(setup.os, "killpg", create=True) as killpg, \
+                mock.patch.object(setup.signal, "SIGKILL", 9, create=True), \
+                mock.patch.object(setup.subprocess, "run") as run:
+            setup._terminate_process_tree(process)
+        killpg.assert_called_once_with(31337, 9)
+        run.assert_not_called()
+        self.assertEqual(process.killed, 0)
+
+        # When the group kill fails and the probe still runs, it is killed
+        # directly rather than left behind.
+        process = RunningProcess()
+        with mock.patch.object(setup.os, "name", "posix"), \
+                mock.patch.object(setup.os, "killpg", create=True,
+                                  side_effect=ProcessLookupError()), \
+                mock.patch.object(setup.signal, "SIGKILL", 9, create=True):
+            setup._terminate_process_tree(process)
+        self.assertEqual(process.killed, 1)
 
     def test_capture_setup_and_windows_fallback_release_owned_handles(self):
         setup = load_setup()
@@ -3342,6 +3446,33 @@ class RelaySetupTests(unittest.TestCase):
         self.assertFalse(any(thread.name.startswith("vibepulse-drain-")
                              for thread in threading.enumerate()))
 
+    def test_doctor_accepts_a_plugin_listing_that_fills_the_output_cap(self):
+        # `codex plugin list --json` is ~22 KiB on a real install; the cap
+        # must hold a listing that large, and exactly-at-cap is retained.
+        setup = load_setup()
+        listing = json.dumps(plugin_listing())
+        self.assertGreater(setup.MAX_COMMAND_OUTPUT_BYTES, 22 * 1024)
+        padded = listing + " " * (setup.MAX_COMMAND_OUTPUT_BYTES -
+                                  len(listing.encode("utf-8")))
+        self.assertEqual(len(padded.encode("utf-8")),
+                         setup.MAX_COMMAND_OUTPUT_BYTES)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            setup.save_config(path, setup.VibePulseConfig(
+                codex_interactions=True))
+            runner = FakeRunner([
+                python_probe_ok(), codex_probe_ok(),
+                result(stdout=padded), json_result([owned_mcp()]),
+            ])
+            output = io.StringIO()
+            setup.main(
+                ["doctor"], repo_root=ROOT, config_path=path,
+                python=Path(sys.executable), codex=CODEX, run=runner,
+                urlopen=lambda *_args, **_kwargs:
+                    BytesResponse(healthy_diagnostics()),
+                stdout=output)
+            self.assertIn("PASS Codex plugin", output.getvalue())
+
     def test_absence_allowlist_is_exact_anchored_and_command_scoped(self):
         setup = load_setup()
         accepted = "Error: marketplace `torget` is not configured or installed\n"
@@ -3360,6 +3491,131 @@ class RelaySetupTests(unittest.TestCase):
                     marketplace_remove, message))
         self.assertFalse(setup._known_absent(
             ["/codex", "mcp", "remove", "vibepulse"], accepted))
+
+
+class OwnershipEvidenceTests(unittest.TestCase):
+    """Ownership proofs must survive real Codex/Windows spellings without
+    loosening: root-only marketplace rows, \\\\?\\ paths, CRLF probes."""
+
+    def test_marketplace_root_only_rows_are_verified_as_strictly_as_source(self):
+        setup = load_setup()
+
+        def root_only(listing):
+            listing["marketplaces"][0].pop("marketplaceSource")
+            return json.dumps(listing)
+
+        # Newer Codex omits marketplaceSource for a local marketplace; the
+        # real root alone is then sufficient evidence.
+        self.assertIs(setup._marketplace_state(
+            root_only(marketplace_listing()), ROOT), True)
+        self.assertIs(setup._marketplace_state(
+            json.dumps(marketplace_listing()), ROOT), True)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            repo = base / "repo"
+            repo.mkdir()
+            foreign = base / "foreign"
+            foreign.mkdir()
+            alias = base / "repo-alias"
+            alias.symlink_to(repo, target_is_directory=True)
+            parent_alias = base / "parent-alias"
+            parent_alias.symlink_to(base, target_is_directory=True)
+            self.assertIs(setup._marketplace_state(
+                root_only(marketplace_listing(repo=repo)), repo), True)
+            rejected = {
+                "foreign root": foreign,
+                "final symlink": alias,
+                "parent symlink": parent_alias / "repo",
+                "dotdot": repo / "foreign" / "..",
+                "relative": os.path.relpath(repo, ROOT),
+                "trailing separator": str(repo) + os.sep,
+                "lookalike": base / "repo-lookalike",
+            }
+            for label, root in rejected.items():
+                with self.subTest(label=label):
+                    self.assertIsNone(setup._marketplace_state(
+                        root_only(marketplace_listing(repo=repo, root=root)),
+                        repo))
+            # Root-only is a known shape, not a licence for extra keys, and
+            # a present marketplaceSource is still checked in full.
+            extra = marketplace_listing(repo=repo)
+            extra["marketplaces"][0].pop("marketplaceSource")
+            extra["marketplaces"][0]["unexpected"] = True
+            self.assertIsNone(setup._marketplace_state(json.dumps(extra), repo))
+            self.assertIsNone(setup._marketplace_state(json.dumps(
+                marketplace_listing(repo=repo, source=foreign)), repo))
+            self.assertIsNone(setup._marketplace_state(json.dumps(
+                marketplace_listing(repo=repo, root=foreign)), repo))
+
+    def test_extended_length_windows_spellings_name_the_same_directory(self):
+        setup = load_setup()
+        root = ROOT.resolve(strict=True)
+        extended = "\\\\?\\" + str(root)
+        self.assertTrue(setup._is_exact_existing_directory(extended, root))
+        self.assertTrue(setup._is_exact_existing_directory(str(root), root))
+        listing = plugin_listing(marketplace_root=extended)
+        self.assertTrue(setup._plugin_installed(json.dumps(listing), ROOT))
+        marketplace = marketplace_listing(root=extended, source=extended)
+        self.assertIs(setup._marketplace_state(json.dumps(marketplace), ROOT),
+                      True)
+
+        self.assertEqual(
+            setup._strip_extended_prefix("\\\\?\\UNC\\server\\share\\repo"),
+            "\\\\server\\share\\repo")
+        self.assertEqual(setup._strip_extended_prefix("\\\\?\\C:\\repo"),
+                         "C:\\repo")
+        self.assertEqual(setup._strip_extended_prefix("C:\\repo"), "C:\\repo")
+        self.assertEqual(setup._strip_extended_prefix("\\\\server\\share"),
+                         "\\\\server\\share")
+
+        # The prefix only changes spelling: it never unlocks a non-canonical
+        # or foreign path, and a bare prefix is not a path at all.
+        for value in (
+                "\\\\?\\",
+                "\\\\?\\UNC\\",
+                "\\\\?\\" + str(root) + os.sep,
+                "\\\\?\\" + str(root.parent / (root.name + "-lookalike")),
+                "\\\\?\\" + os.path.relpath(root, root.parent),
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(setup._is_exact_existing_directory(value, root))
+
+    def test_raw_pipe_probe_output_is_newline_normalised_before_matching(self):
+        setup = load_setup()
+
+        def decoded(stdout, stderr=b""):
+            return setup._decode_command_result(
+                0, {"stdout": bytearray(stdout), "stderr": bytearray(stderr)})
+
+        # Windows children write CRLF through the raw pipes, which bypass
+        # subprocess's universal newlines; the boundary supplies them.
+        python_probe = decoded(b"vibepulse-python-3.11+\r\n")
+        self.assertEqual(python_probe.stdout, "vibepulse-python-3.11+\n")
+        self.assertTrue(setup._python_probe_ok(
+            Path(sys.executable), FakeRunner([python_probe])))
+        codex_probe = decoded(b"codex-cli 0.148.0-alpha.9\r\n")
+        self.assertEqual(codex_probe.stdout, "codex-cli 0.148.0-alpha.9\n")
+        self.assertTrue(setup._codex_probe_ok(CODEX, FakeRunner([codex_probe])))
+
+        self.assertEqual(decoded(b"a\rb\r\nc\n").stdout, "a\nb\nc\n")
+        self.assertEqual(decoded(b"", b"warn\r\n").stderr, "warn\n")
+        # Normalisation changes line endings only: stderr noise, invalid
+        # UTF-8 and over-cap output are rejected exactly as before.
+        self.assertFalse(setup._python_probe_ok(
+            Path(sys.executable),
+            FakeRunner([decoded(b"vibepulse-python-3.11+\r\n", b"\r\n")])))
+        self.assertFalse(setup._codex_probe_ok(
+            CODEX, FakeRunner([decoded(b"not codex 1.2.3\r\n")])))
+        self.assertIsNone(decoded(b"\xff"))
+        self.assertIsNone(decoded(
+            b"x" * (setup.MAX_COMMAND_OUTPUT_BYTES + 1)))
+        self.assertEqual(
+            len(decoded(b"x" * setup.MAX_COMMAND_OUTPUT_BYTES).stdout),
+            setup.MAX_COMMAND_OUTPUT_BYTES)
+        self.assertIsNone(setup._decode_command_result(
+            0, {"stdout": bytearray(b"ok\r\n"), "stderr": bytearray()},
+            reader_errors=[OSError("reader died")]))
 
 
 if __name__ == "__main__":

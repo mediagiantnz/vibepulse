@@ -29,6 +29,7 @@
 #include "app_tokens.h"
 #include "interaction_relay_crypto.h"
 #include "interaction_relay_policy.h"
+#include "needs_you_net.h"
 #include "needs_you_policy.h"
 #include "secrets.h"
 #include "torget.h"
@@ -107,6 +108,17 @@ static _Atomic uint32_t s_failures;
 static _Atomic int s_last_http_status;
 static _Atomic bool s_running;
 static _Atomic bool s_started;
+static bool s_stack_logged;
+
+/* One line, once, after the first full poll+decode: the 10 KiB task does
+ * the TLS handshake plus two 1 KiB locals, and until this number existed
+ * the budget was a guess. */
+static void log_stack_once(void) {
+  if (s_stack_logged) return;
+  s_stack_logged = true;
+  ESP_LOGI(TAG, "stack: minst %u byte fria efter första fullständiga poll",
+           (unsigned)uxTaskGetStackHighWaterMark(NULL));
+}
 
 static uint64_t monotonic_ms(void) {
   int64_t value = esp_timer_get_time();
@@ -373,8 +385,12 @@ static bool decode_pending(const relay_next_item *item,
       sizeof crypto_work);
   if (decoded != TK_IR_OK) return false;
 
+  /* Expiry is a wall-clock comparison. Without a synced clock it cannot be
+   * evaluated, and a row whose deadline is unknown must not be shown as if
+   * it were live; time(NULL) <= 0 never fires on this board (see
+   * tk_wall_clock_synced). */
   time_t wall_seconds = time(NULL);
-  if (wall_seconds <= 0) {
+  if (!tk_wall_clock_synced((int64_t)wall_seconds)) {
     memset(&request, 0, sizeof request);
     return false;
   }
@@ -545,6 +561,7 @@ static bool poll_request(relay_http_client *poll_client) {
   memset(&pending, 0, sizeof pending);
   atomic_fetch_add(&s_polls_ok, 1u);
   atomic_fetch_add(&s_requests_applied, 1u);
+  log_stack_once();
   return true;
 }
 
@@ -560,7 +577,7 @@ static bool decode_status_snapshot(const relay_status_item *item,
     return false;
   }
   time_t wall_seconds = time(NULL);
-  if (wall_seconds <= 0) goto reject;
+  if (!tk_wall_clock_synced((int64_t)wall_seconds)) goto reject;
   uint64_t now_wall_ms = (uint64_t)wall_seconds * 1000u;
   uint64_t inner_expiry_ms = (uint64_t)decoded_status.expires_at * 1000u;
   if (item->expires_at_ms <= now_wall_ms ||
@@ -610,6 +627,7 @@ static bool poll_status(relay_http_client *client) {
     atomic_fetch_add(&s_status_applied, 1u);
   }
   atomic_fetch_add(&s_status_polls_ok, 1u);
+  log_stack_once();
   return true;
 }
 

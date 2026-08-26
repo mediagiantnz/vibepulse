@@ -56,6 +56,36 @@ writes the panel token/mailbox/origin into the generated block in gitignored
 Enabling the Worker does not enable the panel firmware task. That remains a
 separate default-off Kconfig choice and requires a reviewed rebuild.
 
+## Updating an installed Worker
+
+`npm run deploy` is a guard, not a plain `wrangler deploy`. The committed
+`wrangler.jsonc` carries a placeholder `MAILBOX_ID` so the config can be
+dry-built in a fresh clone; deploying it as-is would replace the random
+mailbox id the installer set and strand the Mac and panel. Pass the installed
+id (the value of `TK_VIBEPULSE_INTERACTION_MAILBOX` in your `secrets.h`):
+
+```sh
+cd tools/interaction-relay
+npm ci
+npm test
+npm run deploy -- --mailbox-id vp_YOUR_INSTALLED_ID --dry-run
+npm run deploy -- --mailbox-id vp_YOUR_INSTALLED_ID
+```
+
+The guard refuses the placeholder and malformed ids before Wrangler starts.
+Worker Secrets (`MAC_TOKEN`, `PANEL_TOKEN`) survive a redeploy. `npm run
+deploy:dry` still dry-builds the committed placeholder config without deploying.
+
+## Platform logs
+
+The committed configuration keeps Workers Logs on for the Worker's own
+redacted lines (route kind, status, duration) but sets
+`observability.logs.invocation_logs` to `false`. Invocation logs would retain
+every request URL and header, including the `Authorization` bearer tokens, for
+seven days. A Worker deployed before that setting existed should be redeployed
+and its tokens rotated (`relay uninstall --delete-worker`, then `relay
+install`).
+
 ## API
 
 All successful and error responses include `Cache-Control: no-store`. There

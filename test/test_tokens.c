@@ -110,6 +110,8 @@ int main(void) {
           && !t.codex_session.has_reset);
     check("codex vecka", t.codex_week.has_pct && t.codex_week.pct == 35.0
           && t.codex_week.reset_min == 2317);
+    check("fixturen bär värdens UTC-offset",
+          t.has_tz_offset_min && t.tz_offset_min == 120);
     free(json);
   }
 
@@ -202,12 +204,12 @@ int main(void) {
               "\"daySessions\":1,\"monthTokens\":1," BASE_NULLS ","
               "\"codexForecastState\":\"exhausts\","
               "\"codexForecastAt\":9223372036854774784,"
-              "\"codexForecastOffsetMin\":2147483647}", &t) &&
+              "\"codexForecastOffsetMin\":527040}", &t) &&
               t.codex_forecast.state == TK_FORECAST_EXHAUSTS &&
               t.codex_forecast.has_at_epoch &&
               t.codex_forecast.at_epoch == 9223372036854774784LL &&
               t.codex_forecast.has_offset_min &&
-              t.codex_forecast.offset_min == 2147483647);
+              t.codex_forecast.offset_min == 527040);
   check("int64-epoch vid 2^63 gör prognosen otillgänglig",
         PARSE("{\"v\":2,\"dayTokens\":1,\"dayTokensPerHour\":0,"
               "\"daySessions\":1,\"monthTokens\":1," BASE_NULLS ","
@@ -217,22 +219,92 @@ int main(void) {
               t.day_tokens == 1 &&
               t.codex_forecast.state == TK_FORECAST_UNAVAILABLE &&
               !t.codex_forecast.has_at_epoch);
-  check("offset vid INT_MIN accepteras",
+  /* Offseten är begränsad till ett år (TK_FORECAST_OFFSET_LIMIT_MIN):
+   * presentern negerar den, och -INT_MIN är odefinierat. Utanför gränsen
+   * degraderar hela prognosen, aldrig bara talet. */
+  check("offset vid minus ett år accepteras",
+        PARSE("{\"v\":2,\"dayTokens\":1,\"dayTokensPerHour\":0,"
+              "\"daySessions\":1,\"monthTokens\":1," BASE_NULLS ","
+              "\"codexForecastState\":\"exhausts\","
+              "\"codexForecastAt\":1,"
+              "\"codexForecastOffsetMin\":-527040}", &t) &&
+              t.codex_forecast.state == TK_FORECAST_EXHAUSTS &&
+              t.codex_forecast.offset_min == -527040);
+  check("offset under minus ett år gör prognosen otillgänglig",
+        PARSE("{\"v\":2,\"dayTokens\":1,\"dayTokensPerHour\":0,"
+              "\"daySessions\":1,\"monthTokens\":1," BASE_NULLS ","
+              "\"codexForecastState\":\"exhausts\","
+              "\"codexForecastAt\":1,"
+              "\"codexForecastOffsetMin\":-527041}", &t) &&
+              t.day_tokens == 1 &&
+              t.codex_forecast.state == TK_FORECAST_UNAVAILABLE &&
+              !t.codex_forecast.has_offset_min);
+  check("offset vid INT_MIN gör prognosen otillgänglig, inte en negation",
         PARSE("{\"v\":2,\"dayTokens\":1,\"dayTokensPerHour\":0,"
               "\"daySessions\":1,\"monthTokens\":1," BASE_NULLS ","
               "\"codexForecastState\":\"exhausts\","
               "\"codexForecastAt\":1,"
               "\"codexForecastOffsetMin\":-2147483648}", &t) &&
-              t.codex_forecast.state == TK_FORECAST_EXHAUSTS &&
-              t.codex_forecast.offset_min == (-2147483647 - 1));
-  check("offset vid INT_MAX plus ett gör prognosen otillgänglig",
+              t.codex_forecast.state == TK_FORECAST_UNAVAILABLE &&
+              !t.codex_forecast.has_offset_min);
+  check("offset över ett år gör prognosen otillgänglig",
         PARSE("{\"v\":2,\"dayTokens\":1,\"dayTokensPerHour\":0,"
               "\"daySessions\":1,\"monthTokens\":1," BASE_NULLS ","
               "\"codexForecastState\":\"exhausts\","
               "\"codexForecastAt\":1,"
-              "\"codexForecastOffsetMin\":2147483648}", &t) &&
+              "\"codexForecastOffsetMin\":527041}", &t) &&
               t.codex_forecast.state == TK_FORECAST_UNAVAILABLE &&
               !t.codex_forecast.has_offset_min);
+
+  /* tzOffsetMin: värdens UTC-offset i minuter, [-900, 900]. Frånvarande
+   * eller ogiltigt = okänt, och okänt får aldrig fälla kvotsiffrorna. */
+  check("tzOffsetMin parsas",
+        PARSE("{\"v\":2,\"dayTokens\":1,\"dayTokensPerHour\":0,"
+              "\"daySessions\":1,\"monthTokens\":1," BASE_NULLS ","
+              "\"tzOffsetMin\":720}", &t) &&
+              t.has_tz_offset_min && t.tz_offset_min == 720);
+  check("negativ tzOffsetMin parsas",
+        PARSE("{\"v\":2,\"dayTokens\":1,\"dayTokensPerHour\":0,"
+              "\"daySessions\":1,\"monthTokens\":1," BASE_NULLS ","
+              "\"tzOffsetMin\":-300}", &t) &&
+              t.has_tz_offset_min && t.tz_offset_min == -300);
+  check("tzOffsetMin vid gränserna accepteras",
+        PARSE("{\"v\":2,\"dayTokens\":1,\"dayTokensPerHour\":0,"
+              "\"daySessions\":1,\"monthTokens\":1," BASE_NULLS ","
+              "\"tzOffsetMin\":-900}", &t) &&
+              t.has_tz_offset_min && t.tz_offset_min == -900 &&
+        PARSE("{\"v\":2,\"dayTokens\":1,\"dayTokensPerHour\":0,"
+              "\"daySessions\":1,\"monthTokens\":1," BASE_NULLS ","
+              "\"tzOffsetMin\":900}", &t) &&
+              t.has_tz_offset_min && t.tz_offset_min == 900);
+  check("frånvarande tzOffsetMin är okänt",
+        PARSE("{\"v\":2,\"dayTokens\":1,\"dayTokensPerHour\":0,"
+              "\"daySessions\":1,\"monthTokens\":1," BASE_NULLS "}", &t) &&
+              !t.has_tz_offset_min);
+  check("tzOffsetMin utanför [-900, 900] är okänt utan att fälla usage",
+        PARSE("{\"v\":2,\"dayTokens\":1,\"dayTokensPerHour\":0,"
+              "\"daySessions\":1,\"monthTokens\":1," BASE_NULLS ","
+              "\"tzOffsetMin\":901}", &t) &&
+              t.day_tokens == 1 && !t.has_tz_offset_min &&
+        PARSE("{\"v\":2,\"dayTokens\":1,\"dayTokensPerHour\":0,"
+              "\"daySessions\":1,\"monthTokens\":1," BASE_NULLS ","
+              "\"tzOffsetMin\":-901}", &t) &&
+              !t.has_tz_offset_min);
+  check("fraktionell, null eller sträng-tzOffsetMin är okänt",
+        PARSE("{\"v\":2,\"dayTokens\":1,\"dayTokensPerHour\":0,"
+              "\"daySessions\":1,\"monthTokens\":1," BASE_NULLS ","
+              "\"tzOffsetMin\":12.5}", &t) && !t.has_tz_offset_min &&
+        PARSE("{\"v\":2,\"dayTokens\":1,\"dayTokensPerHour\":0,"
+              "\"daySessions\":1,\"monthTokens\":1," BASE_NULLS ","
+              "\"tzOffsetMin\":null}", &t) && !t.has_tz_offset_min &&
+        PARSE("{\"v\":2,\"dayTokens\":1,\"dayTokensPerHour\":0,"
+              "\"daySessions\":1,\"monthTokens\":1," BASE_NULLS ","
+              "\"tzOffsetMin\":\"+02:00\"}", &t) && !t.has_tz_offset_min);
+  check_rejected_untouched(
+      "dubblerad tzOffsetMin avvisas som varje känd nyckel",
+      "{\"v\":2,\"dayTokens\":1,\"dayTokensPerHour\":0,"
+      "\"daySessions\":1,\"monthTokens\":1," BASE_NULLS ","
+      "\"tzOffsetMin\":60,\"tzOffsetMin\":120}", &t);
 
   check("null valfria fält accepteras",
         PARSE("{\"v\":2,\"dayTokens\":0,\"dayTokensPerHour\":0,"
@@ -501,6 +573,34 @@ int main(void) {
 
   check_rejected_untouched("trunkerad avvisas", "{\"v\":2,\"dayTok", &t);
   check_rejected_untouched("html avvisas", "<html>502</html>", &t);
+
+  /* Fientligt djup: cJSON rekurserar per nivå och parsern kör på en 6 KB
+   * taskstack, så CJSON_NESTING_LIMIT är 16 i alla tre byggena (target,
+   * simulator, run.sh). Ett 20 nivåer djupt fält avvisas rent - utan taket
+   * hade det parsat (okända nycklar är tillåtna) och en 1000-nivåers kropp
+   * hade panikat panelen. Tolv nivåer ryms under taket och bevisar att
+   * gränsen är den avsedda, inte "avvisa allt nästlat". */
+  {
+    char deep[1200];
+    char shallow[1200];
+    char brackets[64] = {0};
+    for (int i = 0; i < 20; i++) brackets[i] = '[';
+    for (int i = 0; i < 20; i++) brackets[20 + i] = ']';
+    snprintf(deep, sizeof deep,
+             "{\"v\":2,\"dayTokens\":1,\"dayTokensPerHour\":0,"
+             "\"daySessions\":1,\"monthTokens\":1," BASE_NULLS
+             ",\"x\":%s}", brackets);
+    check_rejected_untouched("20 nivåers nästling avvisas rent", deep, &t);
+    memset(brackets, 0, sizeof brackets);
+    for (int i = 0; i < 12; i++) brackets[i] = '[';
+    for (int i = 0; i < 12; i++) brackets[12 + i] = ']';
+    snprintf(shallow, sizeof shallow,
+             "{\"v\":2,\"dayTokens\":1,\"dayTokensPerHour\":0,"
+             "\"daySessions\":1,\"monthTokens\":1," BASE_NULLS
+             ",\"x\":%s}", brackets);
+    check("12 nivåers nästling ryms under taket",
+          PARSE(shallow, &t) && t.day_tokens == 1);
+  }
 
 
   /* ---- the value multiple ------------------------------------------

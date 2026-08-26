@@ -10,7 +10,13 @@ describe("interaction relay Worker configuration", () => {
     expect(config.main).toBe("src/index.ts");
     expect(config.compatibility_date).toBe("2026-08-20");
     expect(config.compatibility_flags).toContain("nodejs_compat");
-    expect(config.observability).toMatchObject({ enabled: true });
+    // Invocation logs retain the Authorization header (both bearer tokens)
+    // for seven days; only the Worker's own redacted console.log lines may
+    // reach Workers Logs.
+    expect(config.observability).toEqual({
+      enabled: true,
+      logs: { invocation_logs: false },
+    });
     expect(config.durable_objects).toEqual({
       bindings: [{
         name: "INTERACTION_MAILBOX",

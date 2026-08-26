@@ -83,34 +83,57 @@ static void join_submission_clear(void) {
 /* ------------------------------------------------------ AP-lösenordet */
 
 /*
- * Med TG_OTA_TOKEN i secrets.h HÄRLEDS lösenordet ur token, så
- * tools/wifi-here.sh kan räkna fram exakt samma sträng på Macen och
- * ansluta utan att någon läser av glaset. Det ger ingen ny behörighet:
- * den som redan har token kan skriva firmware till panelen.
+ * Vilket lösenord accesspunkten får avgörs av HUR fönstret öppnades
+ * (tg_wifi_ap_psk_source, värdtestad):
  *
- * Utan token blir lösenordet slumpat per fönster och finns bara på glaset.
- * Domänsträngen gör härledningen skild från token självt — samma hemlighet,
- * två separata nycklar.
+ *  - KEY3-håll + TG_OTA_TOKEN i secrets.h: lösenordet HÄRLEDS ur token, så
+ *    tools/wifi-here.sh kan räkna fram exakt samma sträng på Macen och
+ *    ansluta utan att någon läser av glaset. Det ger ingen ny behörighet:
+ *    den som redan har token kan skriva firmware till panelen. Domän-
+ *    strängen gör härledningen skild från token självt.
+ *  - Ett fönster som öppnat SIG SJÄLVT (90 s utan IP), eller en panel utan
+ *    token: slumpat per fönster, finns bara på glaset och i QR-koden. Det
+ *    automatiska fönstret kan provoceras fram utifrån av den som kan hålla
+ *    stationen borta från sitt nät (en oautentiserad deauth-flod räcker),
+ *    och en långlivad hemlighet ska aldrig lämnas ut till ett fönster som
+ *    ingen vid panelen bett om.
  */
-static void derive_ap_password(void) {
+static void derive_ap_password(tg_wifi_psk_source source) {
+  bool derived = false;
 #ifdef TG_OTA_TOKEN
-  static const char domain[] = "vibepulse-softap-v1";
-  unsigned char digest[32];
-  mbedtls_sha256_context ctx;
-  mbedtls_sha256_init(&ctx);
-  mbedtls_sha256_starts(&ctx, 0);
-  mbedtls_sha256_update(&ctx, (const unsigned char *)domain, sizeof domain - 1);
-  mbedtls_sha256_update(&ctx, (const unsigned char *)TG_OTA_TOKEN,
-                        strlen(TG_OTA_TOKEN));
-  mbedtls_sha256_finish(&ctx, digest);
-  mbedtls_sha256_free(&ctx);
-  for (int i = 0; i < 6; i++)
-    snprintf(s_ap_pass + i * 2, 3, "%02x", digest[i]);
+  if (source == TG_WIFI_PSK_TOKEN_DERIVED) {
+    static const char domain[] = "vibepulse-softap-v1";
+    unsigned char digest[32];
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);
+    mbedtls_sha256_update(&ctx, (const unsigned char *)domain,
+                          sizeof domain - 1);
+    mbedtls_sha256_update(&ctx, (const unsigned char *)TG_OTA_TOKEN,
+                          strlen(TG_OTA_TOKEN));
+    mbedtls_sha256_finish(&ctx, digest);
+    mbedtls_sha256_free(&ctx);
+    for (int i = 0; i < 6; i++)
+      snprintf(s_ap_pass + i * 2, 3, "%02x", digest[i]);
+    derived = true;
+  }
 #else
-  for (int i = 0; i < 6; i++)
-    snprintf(s_ap_pass + i * 2, 3, "%02x", (unsigned)(esp_random() & 0xFF));
+  (void)source;
 #endif
+  if (!derived) {
+    /* Samma alfabet och längd som den härledda: 12 hextecken, 48 bitar. */
+    for (int i = 0; i < 6; i++)
+      snprintf(s_ap_pass + i * 2, 3, "%02x", (unsigned)(esp_random() & 0xFF));
+  }
   s_ap_pass[12] = '\0';
+}
+
+static bool ap_token_available(void) {
+#ifdef TG_OTA_TOKEN
+  return true;
+#else
+  return false;
+#endif
 }
 
 /* ------------------------------------------------------------- skanning */
@@ -454,6 +477,10 @@ static void server_start(void) {
   cfg.max_uri_handlers = 4;
   cfg.uri_match_fn = httpd_uri_match_wildcard;
   cfg.stack_size = 4096;
+  /* Samma lwip-budget som OTA-lyssnaren (10 sockar för hela enheten):
+   * telefonens sida + dess statuspoll + en till. HTTPD_DEFAULT_CONFIG:s sju
+   * hade låtit en enda nyfiken klient äta upp apparnas hämtningar. */
+  cfg.max_open_sockets = 3;
 
   if (httpd_start(&s_server, &cfg) != ESP_OK) {
     ESP_LOGE(TAG, "http-servern startade inte — glaset visar ändå nätet");
@@ -486,7 +513,9 @@ static size_t dma_log(const char *stage) {
 
 static void window_close(void);
 
-static void window_open(void) {
+/* opened_by_hold: KEY3 (a person at the panel) rather than the automatic
+ * 90 s timer; it decides the access point's PSK source. */
+static void window_open(bool opened_by_hold) {
   /* GRIND 1, före allt: ryms accesspunkten utan att närma sig flushens
    * DMA-tak? Ett vägrat fönster är en loggrad och ett nytt försök om en
    * stund; en fryst panel är en USB-räddning. */
@@ -515,7 +544,9 @@ static void window_open(void) {
   vTaskDelay(pdMS_TO_TICKS(200));
 
   scan_networks();
-  derive_ap_password();
+  tg_wifi_psk_source psk_source =
+      tg_wifi_ap_psk_source(opened_by_hold, ap_token_available());
+  derive_ap_password(psk_source);
   dma_log("efter skanning");
 
   if (!s_ap_netif) s_ap_netif = esp_netif_create_default_wifi_ap();
@@ -572,8 +603,11 @@ static void window_open(void) {
 
   atomic_store(&s_open, true);
   /* Lösenordet står på glaset, inte i loggen: den som läser serieloggen
-   * har redan kabeln, men loggen kan hamna i en bugrapport. */
-  ESP_LOGI(TAG, "setupfönstret öppet i tio minuter (%s)", AP_SSID);
+   * har redan kabeln, men loggen kan hamna i en bugrapport. Källan får
+   * loggas, den avslöjar inget. */
+  ESP_LOGI(TAG, "setupfönstret öppet i tio minuter (%s, PSK %s)", AP_SSID,
+           psk_source == TG_WIFI_PSK_TOKEN_DERIVED ? "härledd ur token"
+                                                    : "slumpad");
 }
 
 static void window_close(void) {
@@ -604,6 +638,7 @@ static void guard_task(void *arg) {
   int64_t got_ip_us = 0;
   tg_wifi_slot active_trial = {0};
   uint32_t applied_seq = 0;
+  bool trial_live = false; /* försöket ligger i radion och inget ersatt det */
 
   for (;;) {
     /* Ett KEY3-håll väcker oss direkt. Timeouten behåller den vanliga
@@ -642,10 +677,11 @@ static void guard_task(void *arg) {
         opened_us = now;
         got_ip_us = 0;
         applied_seq = 0;
+        trial_live = false;
         memset(&active_trial, 0, sizeof active_trial);
         atomic_store(&s_phase, TG_WIFI_PHASE_STARTING);
         torget_wifi_ui_set(TG_WIFI_UI_STARTING, NULL, NULL, NULL, 0);
-        window_open();
+        window_open(asked);
         if (!atomic_load(&s_open)) { /* öppningen föll — försök inte i loop */
           opened_us = 0;
           last_close_us = now;
@@ -678,33 +714,41 @@ static void guard_task(void *arg) {
         got_ip_us = 0;
         atomic_store(&s_join_status, TG_WIFI_JOIN_CONNECTING);
         atomic_store(&s_phase, TG_WIFI_PHASE_JOINING);
-        if (!s_hooks->try_credentials ||
-            !s_hooks->try_credentials(active_trial.ssid, active_trial.pass)) {
+        trial_live = s_hooks->try_credentials &&
+                     s_hooks->try_credentials(active_trial.ssid,
+                                              active_trial.pass);
+        if (!trial_live)
           atomic_store(&s_join_status, TG_WIFI_JOIN_RETRY_CONNECTION);
-        }
       }
 
+      /* Ett IP med försöket i radion är beviset, oavsett vilken orsakskod
+       * som hann komma före (orsak 15 vid svag signal fick tidigare
+       * glaset att säga WRONG PASSWORD medan nätet glömdes bort trots att
+       * det just fungerat). Policyn är värdtestad; vakten gör bara
+       * sidoeffekterna vid övergången till CONNECTED. */
       tg_wifi_join_status join_status = atomic_load(&s_join_status);
-      if (join_status == TG_WIFI_JOIN_CONNECTING) {
-        if (!applied_now && have_ip) {
-          /* Detta är den enda skrivvägen: fungerande IP först, NVS sedan. */
-          if (tg_wifi_creds_remember(active_trial.ssid, active_trial.pass)) {
-            got_ip_us = now;
-            memset(active_trial.pass, 0, sizeof active_trial.pass);
-            atomic_store(&s_join_status, TG_WIFI_JOIN_CONNECTED);
-            atomic_store(&s_phase, TG_WIFI_PHASE_JOINED);
-            if (s_hooks->credentials_accepted)
-              s_hooks->credentials_accepted(active_trial.ssid);
-          } else {
-            atomic_store(&s_join_status, TG_WIFI_JOIN_RETRY_CONNECTION);
-            if (s_hooks->credentials_abandoned)
-              s_hooks->credentials_abandoned();
-          }
-        } else if (s_hooks->last_disconnect_reason) {
-          int reason = s_hooks->last_disconnect_reason();
-          if (reason != 0)
-            atomic_store(&s_join_status, tg_wifi_disconnect_status(reason));
+      int reason = s_hooks->last_disconnect_reason
+                       ? s_hooks->last_disconnect_reason() : 0;
+      tg_wifi_join_status next_status = tg_wifi_join_next_status(
+          join_status, trial_live, applied_now, have_ip, reason);
+      if (next_status == TG_WIFI_JOIN_CONNECTED &&
+          join_status != TG_WIFI_JOIN_CONNECTED) {
+        /* Detta är den enda skrivvägen: fungerande IP först, NVS sedan. */
+        if (tg_wifi_creds_remember(active_trial.ssid, active_trial.pass)) {
+          got_ip_us = now;
+          memset(active_trial.pass, 0, sizeof active_trial.pass);
+          atomic_store(&s_join_status, TG_WIFI_JOIN_CONNECTED);
+          atomic_store(&s_phase, TG_WIFI_PHASE_JOINED);
+          if (s_hooks->credentials_accepted)
+            s_hooks->credentials_accepted(active_trial.ssid);
+        } else {
+          atomic_store(&s_join_status, TG_WIFI_JOIN_RETRY_CONNECTION);
+          if (s_hooks->credentials_abandoned)
+            s_hooks->credentials_abandoned();
         }
+        trial_live = false;
+      } else if (next_status != join_status) {
+        atomic_store(&s_join_status, next_status);
       }
 
       if (atomic_exchange(&s_want_close, false) ||
@@ -712,6 +756,7 @@ static void guard_task(void *arg) {
         window_close();
         memset(&active_trial, 0, sizeof active_trial);
         applied_seq = 0;
+        trial_live = false;
         atomic_store(&s_phase, TG_WIFI_PHASE_IDLE);
         last_close_us = now;
         opened_us = 0;

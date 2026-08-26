@@ -205,9 +205,16 @@ export function validateProductionConfig(config, {
       config.compatibility_flags.length !== COMPATIBILITY_FLAGS.length ||
       config.compatibility_flags[0] !== COMPATIBILITY_FLAGS[0])
     throw guardError("compatibility_flags must contain only nodejs_compat");
-  if (!hasExactKeys(config.observability, ["enabled"]) ||
-      config.observability.enabled !== true)
-    throw guardError("observability must be enabled exactly");
+  // Workers Logs invocation logs keep the request URL for seven days, and
+  // for this Worker the URL is the credential. Only the app's own
+  // metadata-only console output may be collected.
+  if (!hasExactKeys(config.observability, ["enabled", "logs"]) ||
+      config.observability.enabled !== true ||
+      !hasExactKeys(config.observability.logs, ["invocation_logs"]) ||
+      config.observability.logs.invocation_logs !== false)
+    throw guardError(
+      "observability must be enabled with invocation_logs disabled exactly",
+    );
 
   const kvBindings = config.kv_namespaces;
   if (!Array.isArray(kvBindings) || kvBindings.length !== 1 ||
@@ -244,7 +251,7 @@ export function validateProductionConfig(config, {
     main: expectedMain,
     compatibility_date: COMPATIBILITY_DATE,
     compatibility_flags: [...COMPATIBILITY_FLAGS],
-    observability: { enabled: true },
+    observability: { enabled: true, logs: { invocation_logs: false } },
     durable_objects: {
       bindings: [{
         name: "NUMBERS_MAILBOX",

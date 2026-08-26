@@ -12,6 +12,12 @@
 # Samtyckeskedjan är avsiktlig: fysiskt håll + token + tidsbegränsat
 # fönster. Skriptet kan aldrig öppna fönstret åt dig — det är poängen.
 # USB-C förblir räddningsvägen om en avbild inte bootar.
+#
+# Token lämnar aldrig Macen: uppladdningen bär ett BEVIS,
+# X-VibePulse-Auth = hex(HMAC-SHA256(nyckel = token, meddelande = avbildens
+# SHA-256-hex)). Enheten räknar fram samma HMAC och kräver dessutom att den
+# strömmade avbilden har exakt den digest beviset täcker. Ett avlyssnat
+# bevis duger därför bara till att skicka samma avbild igen, aldrig en annan.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -28,8 +34,31 @@ TOKEN=$(sed -n 's/.*TG_OTA_TOKEN[^"]*"\([0-9a-f]\{64\}\)".*/\1/p' secrets.h | he
 BUILD_ARG=${2:-}
 
 echo "väntar på underhållsfönstret på $HOST — håll KEY3 ~3 s..."
-while ! curl -s --max-time 2 "http://$HOST/api/ota/status" 2>/dev/null \
-    | grep -q '"maintenance_open":true'; do
+# Två fakta måste stämma innan något skickas: fönstret är öppet OCH den
+# körande avbilden är inte längre PENDING_VERIFY. IDF vägrar esp_ota_begin
+# medan hälsogrinden ännu dömer förra avbilden (ca 15 s efter en OTA-omstart)
+# och enheten svarar 409 för det fallet; den kedjade utvecklingsrytmen väntar
+# här i stället för att snubbla på det. Ett statussvar utan pending_verify
+# är en äldre firmware som inte heller förstår beviset nedan, den måste
+# uppdateras en gång över USB (eller med den gamla ota-flash.sh) först.
+PENDING_SAID=0
+while :; do
+  STATUS=$(curl -s --max-time 2 "http://$HOST/api/ota/status" 2>/dev/null || true)
+  case "$STATUS" in
+    *'"maintenance_open":true'*)
+      case "$STATUS" in
+        *'"pending_verify":false'*) break ;;
+        *'"pending_verify":true'*)
+          if [ "$PENDING_SAID" = 0 ]; then
+            echo "fönstret är öppet men förra avbilden väntar på hälsogrinden, väntar..."
+            PENDING_SAID=1
+          fi ;;
+        *)
+          echo "VÄGRAR: $HOST svarar utan pending_verify, äldre firmware som inte" >&2
+          echo "        förstår uppladdningsbeviset. Flasha den en gång över USB först." >&2
+          exit 1 ;;
+      esac ;;
+  esac
   sleep 1
 done
 
@@ -98,12 +127,49 @@ if [ "${TG_OTA_ALLOW_NO_CI:-0}" != "1" ]; then
   echo "CI grön för $BIN_COMMIT ($CI_GREEN körning(ar))"
 fi
 
+# Uppladdningsbeviset: HMAC-SHA256 med token (dess 64 ASCII-tecken) som
+# nyckel över avbildens SHA-256-hex (64 tecken, utan radbrytning). Kontrol-
+# lerat 2026-08-26 mot Pythons hmac med en känd vektor:
+#   nyckel = "b"*64, meddelande = "a"*64
+#   printf '%s' "$MSG" | openssl dgst -sha256 -hmac "$KEY" | awk '{print $NF}'
+#   == hmac.new(b"b"*64, b"a"*64, hashlib.sha256).hexdigest()
+#   == b9e5ca0b1bb0216bd222b79cdf8d037b8d74e679bcc70968a47117165e2e6357
+# OpenSSL 3 skriver "SHA2-256(stdin)= <hex>", LibreSSL (macOS) "(stdin)= <hex>";
+# awk:s sista fält är hexen i båda. test_ota_sender_gates.py kör samma
+# rörledning mot vektorn där openssl finns. (Nyckeln syns kort i openssl:s
+# argv på DEN HÄR Macen, som redan bär secrets.h. Den går aldrig på nätet.)
+PROOF=$(printf '%s' "$SHA" | openssl dgst -sha256 -hmac "$TOKEN" | awk '{print $NF}')
+printf '%s' "$PROOF" | grep -Eq '^[0-9a-f]{64}$' || {
+  echo "kunde inte räkna fram uppladdningsbeviset (openssl dgst -hmac saknas?)" >&2
+  exit 1
+}
+
 echo "fönstret öppet — laddar upp $BIN ($(wc -c < "$BIN" | tr -d ' ') byte):"
-curl -s --max-time 300 -X POST "http://$HOST/api/ota/firmware" \
-  -H "Authorization: Bearer $TOKEN" \
+# Enhetens svar avgör utgången, inte att curl kom tillbaka: allt utom 202
+# är ett avslag (409 = förra avbilden ännu inte godkänd, 401 = beviset
+# underkänt, 403 = fönstret stängt eller avbilden förkastad efter
+# överföringen) och skriptet slutar då med fel i stället för att skriva
+# framgångsraden ovanpå ett 500 (som det gjorde 2026-08-26).
+REPLY=$(mktemp)
+trap 'rm -f "$REPLY"' EXIT
+RESULT=$(curl -s --max-time 300 -o "$REPLY" -w '%{http_code} %{time_total}' \
+  -X POST "http://$HOST/api/ota/firmware" \
   -H "X-VibePulse-Project: torget" \
   -H "X-VibePulse-Chip: esp32s3" \
   -H "X-VibePulse-SHA256: $SHA" \
-  --data-binary "@$BIN" \
-  -w "\nHTTP %{http_code} på %{time_total}s\n"
+  -H "X-VibePulse-Auth: $PROOF" \
+  --data-binary "@$BIN") || RESULT="000 0"
+CODE=${RESULT%% *}
+SECS=${RESULT#* }
+echo "HTTP $CODE på ${SECS}s: $(cat "$REPLY")"
+if [ "$CODE" != "202" ]; then
+  echo "VÄGRAD av enheten (HTTP $CODE): avbilden är INTE vald för nästa boot." >&2
+  case "$CODE" in
+    409) echo "        förra avbilden väntar ännu på hälsogrinden; kör igen om en stund." >&2 ;;
+    401) echo "        beviset underkändes: TG_OTA_TOKEN i secrets.h matchar inte enhetens." >&2 ;;
+    403) echo "        fönstret stängdes, eller avbilden förkastades efter överföringen." >&2 ;;
+    000) echo "        ingen kontakt med $HOST." >&2 ;;
+  esac
+  exit 1
+fi
 echo "202 = avbilden vald för nästa boot; enheten startar om inom ett par sekunder."

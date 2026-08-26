@@ -54,7 +54,9 @@ cc -std=c11 -Wall -Wextra -Werror -O1 \
 /tmp/torget-core-test
 
 # cJSON kompilerar med sin egen varningsprofil; -Werror gäller VÅRA filer.
-cc -std=c11 -O1 -c ../third_party/cjson/cJSON.c -o /tmp/torget-cjson.o
+# CJSON_NESTING_LIMIT=16 speglar targetets cjson-komponent och simulatorn:
+# parsertesternas fientliga djup ska falla på samma gräns som på panelen.
+cc -std=c11 -O1 -DCJSON_NESTING_LIMIT=16 -c ../third_party/cjson/cJSON.c   -o /tmp/torget-cjson.o
 
 cc -std=c11 -Wall -Wextra -Werror -O1 \
   -DFIXTURES_DIR="\"$(cd ../sim-fixtures && pwd)\"" \
@@ -155,13 +157,6 @@ cc -std=c11 -Wall -Wextra -Werror -O1 \
   test_project_star_chime.c \
   -o /tmp/torget-project-star-chime-test
 /tmp/torget-project-star-chime-test
-
-cc -std=c11 -Wall -Wextra -Werror -O1 \
-  ../components/app_tokens/agent_usage.c \
-  test_agent_usage.c \
-  -lm \
-  -o /tmp/torget-agent-usage-test
-/tmp/torget-agent-usage-test
 
 cc -std=c11 -Wall -Wextra -Werror -O1 \
   ../components/app_tokens/agent_monitor_policy.c \
@@ -284,6 +279,7 @@ cc -std=c11 -Wall -Wextra -Werror -O1 \
 "$PYTHON_BIN" test_interaction_relay_build.py
 "$PYTHON_BIN" test_interaction_relay_net_source.py
 "$PYTHON_BIN" test_vibepulse_codex_plugin.py
+"$PYTHON_BIN" test_cjson_nesting_wiring.py
 
 cd ..
 "$PYTHON_BIN" -m unittest tools.agent_assets.test_build_agent_images -v

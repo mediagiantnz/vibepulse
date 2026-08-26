@@ -2,9 +2,26 @@
 #define NEEDS_YOU_NET_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "interaction_relay_policy.h"
 #include "needs_you_policy.h"
+
+/*
+ * Wall-clock sync gate, shared by every sender that stamps or evaluates a
+ * wall-clock time. The board has no battery-backed RTC: until SNTP has
+ * answered, time(NULL) counts up from the 1970 epoch, so it is never <= 0
+ * and "time is zero" can never detect an unsynced clock (2026-08-26). The
+ * platform's NET_READY waits at most 20 s for SNTP and then proceeds, so
+ * a task that has passed torget_net_wait() still cannot assume a clock.
+ * 1 700 000 000 (2023-11-14) is below any moment this firmware can
+ * legitimately run in and above anything an unsynced clock can reach.
+ * Pure and header-only so the host tests can pin the boundary. */
+#define TK_WALL_CLOCK_SYNC_FLOOR_S 1700000000LL
+
+static inline bool tk_wall_clock_synced(int64_t wall_seconds) {
+  return wall_seconds >= TK_WALL_CLOCK_SYNC_FLOOR_S;
+}
 
 /* The device's answer channel. Registers the takeover's verdict callback and
  * sends signed POSTs to the bridge on a worker task, so a tap never blocks the

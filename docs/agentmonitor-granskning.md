@@ -48,8 +48,9 @@ länkar dem den vägen, lärdom från första länkfelet).
 30-sekunderskadensen är det fint; **vid 1 Hz blir det ~3 600 sockets/timme**
 med TIME_WAIT-churn i lwIP och onödig heappress (lägsta interna heapen har
 varit nere på ~7 KB under TLS-rusning — marginalen är inte oändlig).
-Statuspollen ska ha EN återanvänd klient med keep-alive i appens egen
-statustask (eller 2 s-kadens om det krånglar). Följ `torget: heap:`-raden
+Statuspollen ska ha EN återanvänd klient i appens egen statustask (eller
+2 s-kadens om det krånglar); socketen stängs per poll av den begränsade
+läsloopen, så keep-alive är medvetet inte konfigurerat. Följ `torget: heap:`-raden
 i loggen (10 s-intervall) före/efter — största DMA-blocket får inte krypa
 under ~24 KB.
 

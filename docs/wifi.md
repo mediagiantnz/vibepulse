@@ -92,20 +92,27 @@ consent), hops to the panel's access point, hands the credentials over, and
 releases the Mac's WiFi. The Mac is offline for roughly twenty seconds. This
 is a convenience; the phone flow above is the universal setup path.
 
-The access point's password is **derived** from `TG_OTA_TOKEN` in
-`secrets.h` — `sha256("vibepulse-softap-v1" + token)`, first 12 hex
-characters — so the script computes it without reading anything off the
-glass. This grants nothing new: whoever holds that token can already write
-firmware to the panel. Without the token the password is random per window
-and lives only on the screen; pass it in explicitly:
+The access point's password depends on **how the window opened**. For a
+window you opened with the KEY3 hold, and only then, it is **derived** from
+`TG_OTA_TOKEN` in `secrets.h` (`sha256("vibepulse-softap-v1" + token)`,
+first 12 hex characters), so the script computes it without reading
+anything off the glass. This grants nothing new: whoever holds that token
+can already write firmware to the panel. A window the panel opened **by
+itself** (90 s without an IP) always gets a fresh random password that
+exists only on the glass and in the QR: that window can be provoked from
+outside by anyone able to keep the panel off its network, and a long-lived
+secret is never handed to a window nobody at the panel asked for. Without
+the token every window is random. In both random cases pass the password
+in explicitly:
 
 ```sh
 TG_AP_PASS=<what the glass shows> tools/wifi-here.sh
 ```
 
 `test/test_wifi_setup_wiring.py` asserts the domain string, the digest
-length and the AP name match between the firmware and the script. They
-cannot drift apart silently.
+length and the AP name match between the firmware and the script, and that
+the derivation is gated on the open reason (`tg_wifi_ap_psk_source`,
+host-tested in `test/test_wifi_slots.c`). They cannot drift apart silently.
 
 ### What the top-right Wi-Fi symbol means
 
@@ -128,19 +135,31 @@ unchanged. The setup window inherits two of them and deliberately relaxes
 one:
 
 1. **Physical presence** — the access point's password is on the glass.
-   Whoever cannot see the screen (or hold `secrets.h` on their Mac) cannot
-   get in.
+   For a window opened by the KEY3 hold, `secrets.h` on the Mac is an
+   equivalent key (the password is derived from the token); for a window
+   that opened itself, the glass is the only place the password exists.
+   Whoever can neither see the screen nor held the button cannot get in.
 2. **Time** — ten minutes, then it closes itself and hands back every byte
    it cost. The AP, the HTTP server and the DNS task do not exist outside
    an open window (the lazy-surface rule from the 2026-08-14 freeze).
-3. **The window may open itself** after 90 s without an IP. This weakens
-   nothing: with no network there is no remote that could have opened it,
-   and a panel in a hotel room should not require knowing a secret gesture
-   to become useful again.
+3. **The window may open itself** after 90 s without an IP, so a panel in
+   a hotel room does not require knowing a secret gesture to become useful
+   again. Be honest about what that costs: "no IP for 90 s" is a condition
+   someone within radio range can manufacture (an unauthenticated deauth
+   flood keeps the panel off its network; the ESP-IDF 5.5 station always
+   negotiates Protected Management Frames when the router offers them,
+   which blunts this against PMF routers but does not remove it), so the
+   automatic window must be assumed openable from outside. That is why it
+   never carries the token-derived password, only a random one shown on
+   the glass, and why it can still do nothing but add a network to the
+   list. The exposure is the 802.11 radio, not the setup page.
 
 **The setup window can never write firmware.** It touches the network list
 in NVS and nothing else; OTA keeps its own gate and its own token. The
-wiring test asserts no OTA symbol ever appears in `wifi_setup.c`.
+wiring test asserts that no slot-writing symbol (`esp_ota*`, `ota_ops`)
+ever appears in `wifi_setup.c`. The only OTA calls it makes are
+`torget_ota_service_maintenance_open/close`, the port-80 handover that
+closes an OTA *window*; those cannot write a byte of flash.
 
 ### What KEY3 means now
 
@@ -148,7 +167,8 @@ A 3 s hold opens **the window that can actually help**:
 
 - **With an IP** → the OTA maintenance window, exactly as before.
 - **Without an IP** → the WiFi setup window. An OTA window with no network
-  could never receive an upload anyway.
+  could never receive an upload anyway. Because a person held the button,
+  this is the window whose password `tools/wifi-here.sh` can derive.
 
 **Hold again to switch windows.** A second full 3 s hold while the update
 window is open closes it and opens WIFI SETUP instead. That is how you

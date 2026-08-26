@@ -37,8 +37,12 @@ def main():
         }}
         if len(CONTEXT) > 1400:
             return 0
-        sys.stdout.write(json.dumps(
-            result, ensure_ascii=False, separators=(",", ":")) + "\n")
+        # Bytes, not text: a piped stdout on Windows is cp1252, which would
+        # turn the en dash in CONTEXT into 0x96 and hand Codex invalid UTF-8.
+        sys.stdout.buffer.write((json.dumps(
+            result, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8"))
+        sys.stdout.buffer.flush()
     except Exception:
         pass
     return 0

@@ -22,6 +22,13 @@
 
 extern const torget_app_t tokens_app;
 
+/* Tile order. The seven fixed tiles come first so every index below
+ * TK_USAGE_SCREEN_VIEWS is a real tile in every build; the optional GitHub
+ * tile is LAST and only exists when TK_GITHUB_SCREEN_ENABLED is 1. Putting
+ * an optional tile in the middle once left VIEW_VALUE pointing one past a
+ * seven-element tile array in the default build (empty black column before
+ * the Value page, pager never highlighting it). usage_screen.c static-asserts
+ * this ordering against TK_USAGE_SCREEN_VIEWS. */
 enum {
   VIEW_CLAUDE_FABLE = 0,
   VIEW_CLAUDE_ALL = 1,
@@ -29,8 +36,8 @@ enum {
   VIEW_BURN_RATE = 3,
   VIEW_TRACKER_CLAUDE = 4,
   VIEW_TRACKER_CODEX = 5,
-  VIEW_GITHUB = 6,
-  VIEW_VALUE = 7,
+  VIEW_VALUE = 6,
+  VIEW_GITHUB = 7, /* optional, only created with TK_GITHUB_SCREEN_ENABLED */
 };
 
 /* Ett lyckat /api/tokens-svar. Snappar tickern, stämplar färskhet och

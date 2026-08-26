@@ -28,7 +28,12 @@
 static const char *TAG = "tokens";
 
 #define FETCH_EVERY_MS 30000
-#define BODY_MAX 2048
+/* All-or-nothing body cap for /api/tokens. test/test_token_body_capacity.py
+ * builds the worst-case v2 payload (every field at its widest, incl. the
+ * observedAt epochs, tzOffsetMin and a 31-char OTA version) and requires it
+ * to fit in 75 % of this. 2048 afforded 1536 B; the worst case is now
+ * 1571 B, so 3072 keeps the agreed margin (one static kilobyte of .bss). */
+#define BODY_MAX 3072
 
 #ifdef TK_TOKENS_URL
 

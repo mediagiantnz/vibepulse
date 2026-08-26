@@ -206,7 +206,7 @@ static bool known_top_level_key(const char *key) {
       "claudeForecastOffsetMin", "codexForecastState",
       "codexForecastPctAtReset", "codexForecastPaceFactor",
       "codexForecastAt", "codexForecastOffsetMin",
-      "otaAvailableVersion", "value",
+      "otaAvailableVersion", "value", "tzOffsetMin",
   };
   for (size_t index = 0; index < sizeof keys / sizeof keys[0]; index++) {
     if (strcmp(key, keys[index]) == 0) return true;
@@ -369,9 +369,15 @@ static void optional_forecast(const cJSON *root, const char *prefix,
   if (strcmp(state->valuestring, "exhausts") == 0) {
     int64_t at = 0;
     int64_t offset = 0;
+    /* The offset is bounded to a sane year, not to INT_MIN..INT_MAX: the
+     * presenter negates it, and -INT_MIN is undefined. A forecast further
+     * from its reset than that is a bug upstream, so the whole forecast
+     * degrades to unavailable rather than to a nonsense headline. */
     if (!optional_integer(root, at_key, 0.0, 0x1p63, &at) ||
-        !optional_integer(root, offset_key, (double)INT_MIN,
-                          (double)INT_MAX + 1.0, &offset)) {
+        !optional_integer(root, offset_key,
+                          -(double)TK_FORECAST_OFFSET_LIMIT_MIN,
+                          (double)TK_FORECAST_OFFSET_LIMIT_MIN + 1.0,
+                          &offset)) {
       return;
     }
     out->state = TK_FORECAST_EXHAUSTS;
@@ -449,6 +455,17 @@ bool tk_tokens_parse(const char *json, size_t len, tk_tokens *out) {
   optional_value(root, trust_optional_strings, &t.value);
   optional_forecast(root, "codex", trust_optional_strings,
                     &t.codex_forecast);
+  /* tzOffsetMin: optional, integer minutes, [-900, 900] (UTC-14..UTC+15
+   * exist; anything wider is corrupt). Invalid = unknown, the same lenient
+   * rule as every other optional field: a bad offset must not take the
+   * quota numbers down with it, it just costs the clock time. */
+  {
+    int64_t tz = 0;
+    if (optional_integer(root, "tzOffsetMin", -900.0, 901.0, &tz)) {
+      t.tz_offset_min = (int)tz;
+      t.has_tz_offset_min = 1;
+    }
+  }
 
   /* Inget på den här mätaren kan ärligt vara negativt — ett minustecken är
    * en lögn med ett stavfel (samma regel som sv_group_ll). */

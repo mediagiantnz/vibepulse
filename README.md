@@ -189,7 +189,7 @@ relay or the live agent status relay.
 
 ### Optional GitHub project pulse
 
-One public `owner/repository` can add a deliberately sparse seventh page:
+One public `owner/repository` can add a deliberately sparse eighth page, always the last one:
 the current star count is the hero and forks are the only secondary metric.
 The same raster covers every data provenance, so the glass never lies about
 freshness:
@@ -336,7 +336,9 @@ understand how the pieces fit together.
 
 The commands below show the macOS path. Windows is supported for the host
 service too; use the Windows ESP-IDF environment and the OS-specific host
-address/autostart steps in [the agent runbook](docs/agent-setup.md).
+address/autostart steps in [the agent runbook](docs/agent-setup.md). On
+Windows, `python3` is usually the Microsoft Store alias or absent: run
+`py -3` (or `python`) wherever a command in this README says `python3`.
 
 1. Install [ESP-IDF 5.5](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/index.html)
    and `brew install cmake ninja`
@@ -399,7 +401,9 @@ the new image within 15 seconds — display, UI, scheduler, NVS and memory
 proofs — or the bootloader rolls back to the previous slot automatically.
 USB-C remains the rescue path and is never written by an OTA. After an OTA
 reboot the window re-arms itself once, so a build-test-build session needs
-one hold, not one per build.
+one hold, not one per build. The sender proves it holds the OTA token with an
+HMAC over the image digest, so the token itself never crosses the LAN, and it
+waits for the previous image to pass its health gate before sending the next.
 
 The tokenserver announces the newest build on your computer
 (`otaAvailableVersion` on `/api/tokens`); when the screen runs an older
@@ -578,10 +582,27 @@ platform/            app contract + launcher + fonts (IBM Plex)
 main/                ESP32 host layer: boot, WiFi, SNTP, app registry
 components/app_*     the app (VibePulse lives in app_tokens/)
 tools/tokenserver/   the computer service (core is Python stdlib)
+tools/vibepulse_studio/  exact-size design studio for the hero layout
 sim/                 SDL simulator, the whole platform on your computer
 test/                host tests, run with ./test/run.sh (no ESP-IDF needed)
 spec/                hardware truth + UI design system
 ```
+
+**VibePulse Studio** (`tools/vibepulse_studio/`) is a local, build-free web
+editor for the hero layout at true 1:1 panel pixels. It edits
+`design/vibepulse/studio-design.json`, regenerates
+`components/app_tokens/vibepulse_layout.generated.h` in the same
+transaction so the two can never drift, and exports the approved states as
+exact 480 x 480 PNGs. Start it with `python3 tools/vibepulse_studio/server.py`
+(needs the pinned Pillow from `requirements-dev.txt`); it binds
+`127.0.0.1:64942` and opens your browser. It refuses any non-loopback
+`--host` unless you also pass `--allow-lan`, which mints a per-run mutation
+token, prints it in the URL fragment, and requires it on every save and
+export. It runs on macOS, Linux and Windows; on Windows the repository store
+verifies paths step by step and locks a file instead of using directory
+descriptors and `flock`, which the other platforms keep. Studio approval is
+a design gate only: the physical AMOLED review and the flash authorisation
+in the AMOLED skill still apply.
 
 The deeper docs (architecture, writing an app, hardware traps) are in
 [README.sv.md](README.sv.md), in Swedish, because this started as a Swedish

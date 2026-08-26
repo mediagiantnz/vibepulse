@@ -42,8 +42,47 @@ int main(void) {
   check("en fråga tar över skärmen", view.visible);
   check("frågan erbjuder både godkänn och neka",
         view.offer_approve && view.offer_deny);
-  check("nedräkningen avrundas uppåt", view.seconds_left == 118);
   check("sorten följer med till vyn", view.kind == TK_PENDING_QUESTION);
+
+  /* No answer channel (no device key, sender never started): the screen
+   * may only hand the question back to the terminal. */
+  tk_needs_you_view no_channel = view;
+  tk_needs_you_restrict_offers(&no_channel, false);
+  check("utan svarskanal finns bara LÄMNA DET",
+        no_channel.visible && !no_channel.offer_approve &&
+        !no_channel.offer_deny);
+  check("utan svarskanal får varken godkänn eller neka skickas",
+        !tk_needs_you_allows(&pending, &no_channel,
+                             TK_NEEDS_YOU_VERDICT_APPROVE) &&
+        !tk_needs_you_allows(&pending, &no_channel,
+                             TK_NEEDS_YOU_VERDICT_DENY) &&
+        tk_needs_you_allows(&pending, &no_channel,
+                            TK_NEEDS_YOU_VERDICT_LEAVE_IT));
+  tk_needs_you_view with_channel = view;
+  tk_needs_you_restrict_offers(&with_channel, true);
+  check("med svarskanal ändras inget",
+        with_channel.offer_approve && with_channel.offer_deny);
+  tk_needs_you_restrict_offers(NULL, false);
+
+  /* "ON IT" is only honest for an answer that actually left the device:
+   * the takeover leaves and the payoff plays on the channel's word, never
+   * on the tap alone. LEAVE IT is local and always dismisses. */
+  tk_needs_you_outcome outcome =
+      tk_needs_you_outcome_of(TK_NEEDS_YOU_VERDICT_APPROVE, true);
+  check("köat godkännande försvinner och spelar ON IT",
+        outcome.dismiss && outcome.payoff && !outcome.unsent);
+  outcome = tk_needs_you_outcome_of(TK_NEEDS_YOU_VERDICT_APPROVE, false);
+  check("oköat godkännande stannar kvar och säger NOT SENT",
+        !outcome.dismiss && !outcome.payoff && outcome.unsent);
+  outcome = tk_needs_you_outcome_of(TK_NEEDS_YOU_VERDICT_DENY, true);
+  check("köat nekande försvinner utan ON IT",
+        outcome.dismiss && !outcome.payoff && !outcome.unsent);
+  outcome = tk_needs_you_outcome_of(TK_NEEDS_YOU_VERDICT_DENY, false);
+  check("oköat nekande stannar kvar",
+        !outcome.dismiss && !outcome.payoff && outcome.unsent);
+  outcome = tk_needs_you_outcome_of(TK_NEEDS_YOU_VERDICT_LEAVE_IT, false);
+  check("lämna det är lokalt och försvinner även utan kanal",
+        outcome.dismiss && !outcome.payoff && !outcome.unsent);
 
   /* The countdown ring is expires against the original hold, in per-mille,
    * computed by the policy so the widget never has to guess a duration. */

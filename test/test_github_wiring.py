@@ -28,15 +28,24 @@ class GitHubWiringTests(unittest.TestCase):
             "(TK_GITHUB_SCREEN_ENABLED || TK_GITHUB_NOTIFICATIONS_ENABLED)",
             net)
 
-    def test_github_is_one_optional_seventh_view(self):
+    def test_github_is_the_optional_last_view(self):
         header = read("components/app_tokens/usage_screen.h")
         app = read("components/app_tokens/app_tokens.h")
         ui = read("components/app_tokens/usage_screen.c")
-        # Six base tiles + the optional GitHub tile + the always-present Value
-        # tile: GitHub stays at index 6, Value is the new last tile at 7.
-        self.assertIn("(6 + TK_GITHUB_SCREEN_ENABLED + 1)", header)
-        self.assertIn("VIEW_GITHUB = 6", app)
-        self.assertIn("VIEW_VALUE = 7", app)
+        # Seven fixed tiles (six base + the always-present Value tile) and
+        # then the optional GitHub tile as the LAST index. GitHub used to sit
+        # at 6 with Value at 7, so a default build (GitHub off, seven tiles)
+        # created the Value page one past the tile array.
+        self.assertIn("(7 + TK_GITHUB_SCREEN_ENABLED)", header)
+        self.assertIn("VIEW_VALUE = 6", app)
+        self.assertIn("VIEW_GITHUB = 7", app)
+        self.assertLess(ui.index("create_value_page();"),
+                        ui.index("create_github_page();"))
+        # The ordering is a compile-time invariant, not a convention.
+        self.assertIn("_Static_assert(VIEW_VALUE < TK_USAGE_SCREEN_VIEWS", ui)
+        self.assertIn("_Static_assert(VIEW_GITHUB == TK_USAGE_SCREEN_VIEWS - 1",
+                      ui)
+        self.assertIn("_Static_assert(VIEW_GITHUB >= TK_USAGE_SCREEN_VIEWS", ui)
         self.assertIn("set_star_hero", ui)
         self.assertIn('"FORKS"', ui)
         self.assertNotIn("ISSUES", ui)

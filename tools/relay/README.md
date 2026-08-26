@@ -24,7 +24,10 @@ a new namespace because the bootstrap rollback path needs the existing data.
   "compatibility_date": "2026-08-22",
   "compatibility_flags": ["nodejs_compat"],
   "observability": {
-    "enabled": true
+    "enabled": true,
+    "logs": {
+      "invocation_logs": false
+    }
   },
   "durable_objects": {
     "bindings": [
@@ -58,6 +61,14 @@ The binding is deliberately local: do not add `script_name` or `environment`.
 Worker secret store; `secrets.required` declares its name but never its value.
 The guard rejects every additional top-level field, binding, route, environment,
 variable, flag, secret declaration, or nested object key.
+
+`observability.logs.invocation_logs` must be `false` and the guard enforces it.
+Workers Logs invocation logs retain the request URL and headers for seven days,
+and for this Worker the URL is the credential. The app's own `console.error`
+diagnostics (event name and operation only, never a secret, publisher, or body)
+still reach Workers Logs. If an earlier deployment ran with invocation logs on,
+rotate `RELAY_SECRET` after redeploying with this configuration: the old secret
+was visible in that log window.
 The staged rollout is documented in the
 [coordinated-mailbox design](../../docs/superpowers/specs/2026-08-22-vibepulse-numbers-relay-list-free-design.md): bootstrap first, then the active Worker.
 
@@ -155,6 +166,9 @@ registration, so the scheduled maximum remains under 1,600 billed row writes
 per day for one publisher or under 3,100 for two. These are deliberately rounded
 upper bounds, not exact SQLite billing arithmetic, and remain far below the
 100,000-row daily free limit. The fixed eight-publisher limit bounds every read.
+A ninth name evicts the quietest registered publisher (at most three document
+rows and one registry row deleted) before it registers; that only happens on a
+new name's first publication, never on the steady-state path.
 
 A failed POST is not admitted and does not advance the publisher's send time,
 so it can retry on the next 30-second check. The successful-publication and row

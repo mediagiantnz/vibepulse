@@ -117,6 +117,14 @@ jobs:
           # now one list exists and run.sh guards its completeness.
           python -m unittest \
             $(tr -d '\r' < test/tokenserver-suite.txt | grep -v '^#') -v
+      - name: Run the Codex plugin and setup-script suite on this OS
+        shell: bash
+        run: |
+          # tools/vibepulse_setup.py has Windows-only paths (reader-thread
+          # capture, taskkill, \\?\ spellings, CRLF probes) that the Ubuntu
+          # host gate never executes. The suite is stdlib-only, so every OS
+          # in this matrix runs it against its own process model.
+          python test/test_vibepulse_codex_plugin.py
 
   firmware:
     name: ESP32-S3 firmware build

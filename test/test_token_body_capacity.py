@@ -13,11 +13,25 @@ Standalone: not yet registered in test/run.sh; run with
 
 import json
 import re
+import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 NET_C = REPO_ROOT / "components" / "app_tokens" / "net.c"
+
+sys.path.insert(0, str(REPO_ROOT / "tools" / "tokenserver"))
+
+import codex_usage  # noqa: E402
+import tokenserver  # noqa: E402
+from quota_cache import QuotaCache  # noqa: E402
+from usage_history import UsageHistory  # noqa: E402
+
+# esp_app_desc_t.version is char[32] including the terminator, so the
+# longest version string the OTA announcement can ever carry is 31 chars.
+OTA_VERSION_MAX_CHARS = 31
 
 # Agreed margin: the serialized worst case may use at most 75 % of the
 # buffer, leaving the rest for growth and the buffer's terminator byte.
@@ -54,8 +68,12 @@ def worst_case_payload() -> dict:
         "claudeSessionResetMin": 999_999,
         "claudeWeekPct": 100.0,
         "claudeWeekResetMin": 999_999,
+        # Observation epochs (relay merge-by-time, 100be8f): ten digits
+        # until 2286.
+        "claudeWeekObservedAt": 9_999_999_999,
         "claudeModelWeekPct": 100.0,
         "claudeModelWeekResetMin": 999_999,
+        "claudeModelWeekObservedAt": 9_999_999_999,
         # 14 UTF-8 bytes, inside the ESP's 17-byte label cap; json.dumps
         # (ensure_ascii default, as the server sends it) escapes the
         # middle dot to · which widens it further on the wire.
@@ -64,6 +82,7 @@ def worst_case_payload() -> dict:
         "codexSessionResetMin": 999_999,
         "codexWeekPct": 100.0,
         "codexWeekResetMin": 999_999,
+        "codexWeekObservedAt": 9_999_999_999,
         # deltas
         "claudeWeekTodayDeltaPct": 100.0,
         "claudeModelWeekTodayDeltaPct": 100.0,
@@ -73,6 +92,11 @@ def worst_case_payload() -> dict:
         "claudeWeekStale": False,
         "claudeModelWeekStale": False,
         "codexWeekStale": False,
+        # Host UTC offset in minutes; the widest serialisation is a
+        # negative three-digit offset (UTC-12:00).
+        "tzOffsetMin": -720,
+        # OTA announcement: the newest build's app-descriptor version.
+        "otaAvailableVersion": "v" + "9" * (OTA_VERSION_MAX_CHARS - 1),
     }
     for prefix in ("claude", "codex"):
         payload[f"{prefix}ForecastState"] = "unavailable"
@@ -106,7 +130,78 @@ def serialized_size() -> int:
     return len(json.dumps(worst_case_payload()).encode())
 
 
+def live_snapshot_keys():
+    """The key set get_snapshot() really emits, with every upstream
+    stubbed to its fullest shape and every side effect kept in a temp dir.
+    """
+    now_ts = 1_800_000_000
+    claude = {
+        "sessionPct": 21.0,
+        "sessionResetAt": now_ts + 3600,
+        "weekPct": 47.0,
+        "weekResetAt": now_ts + 300 * 60,
+        "weekObservedAt": now_ts,
+        "weekIdentity": tokenserver._quota_identity(
+            "claude", "general_weekly"),
+        "modelPct": 73.0,
+        "modelResetAt": now_ts + 300 * 60,
+        "modelObservedAt": now_ts,
+        "modelIdentity": tokenserver._quota_identity(
+            "claude", "model_weekly"),
+        "modelLabel": "SONNET · WEEK",
+    }
+    codex = {
+        "codexSessionPct": 12.0,
+        "codexSessionResetMin": 90,
+        "codexSessionWindowMinutes": 300,
+        "codexWeekPct": 35.0,
+        "codexWeekResetAt": now_ts + 300 * 60,
+        "codexWeekObservedAt": now_ts,
+        "codexWeekIdentity": tokenserver._quota_identity(
+            "codex", "general_weekly", "synthetic"),
+        "codexWeekWindowMinutes": 10080,
+    }
+    with tempfile.TemporaryDirectory() as temp_dir, \
+            mock.patch.object(tokenserver, "_persist_quota_records_async"), \
+            mock.patch.object(tokenserver, "get_limits",
+                              return_value=claude), \
+            mock.patch.object(tokenserver, "_read_codex_limits",
+                              return_value=codex), \
+            mock.patch.object(tokenserver, "_ota_available_version",
+                              return_value="v0.0.0"), \
+            mock.patch.object(codex_usage, "month_value",
+                              return_value=(0.0, 0, 0)), \
+            mock.patch.object(tokenserver, "_file_cache", {}):
+        root = Path(temp_dir)
+        projects = root / "projects"
+        projects.mkdir()
+        tokenserver._last_result = None
+        tokenserver._last_computed = 0.0
+        snapshot = tokenserver.get_snapshot(
+            projects, history=UsageHistory(root / "history.json"),
+            now_ts=now_ts,
+            quota_cache=QuotaCache(root / "quota.json",
+                                   now=lambda: now_ts))
+    return set(snapshot), set(snapshot["value"])
+
+
 class TokenBodyCapacityTests(unittest.TestCase):
+    def test_every_emitted_key_is_registered_in_the_gate(self):
+        """A field added to get_snapshot without touching this gate is
+        exactly how the 1 058-byte payload met the 1 024-byte cap (lessons.md,
+        "One byte over budget froze the display")."""
+        gate = worst_case_payload()
+        top_keys, value_keys = live_snapshot_keys()
+        self.assertEqual(
+            top_keys - set(gate), set(),
+            "get_snapshot emits keys the capacity gate does not model")
+        self.assertEqual(
+            set(gate) - top_keys, set(),
+            "the capacity gate models keys get_snapshot no longer emits")
+        self.assertEqual(
+            value_keys - set(gate["value"]), set(),
+            "value_meter emits keys the capacity gate does not model")
+
     def test_worst_case_payload_fits_body_max_with_agreed_margin(self):
         body_max = read_body_max()
         size = serialized_size()

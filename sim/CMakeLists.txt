@@ -67,7 +67,6 @@ add_executable(torget-sim
   ../components/app_tokens/usage_presenter.c
   ../components/app_tokens/usage_screen.c
   ../components/app_tokens/agent_status_parse.c
-  ../components/app_tokens/agent_usage.c
   ../components/app_tokens/agent_monitor_policy.c
   ../components/app_tokens/usage_live_policy.c
   ../components/app_tokens/agent_completion_policy.c
@@ -97,6 +96,11 @@ add_executable(torget-sim
   ${SOLELKOLLEN_SRCS}
   ${BUDDY_SRCS}
   ${FONTS})
+
+# Samma nästningstak som targetets cjson-komponent (16 nivåer): hosten ska
+# bevisa exakt den parser panelen kör, fientligt djup inkluderat.
+set_source_files_properties(../third_party/cjson/cJSON.c PROPERTIES
+  COMPILE_DEFINITIONS CJSON_NESTING_LIMIT=16)
 
 # Simulatorn läser de riktiga fixture-filerna genom de delade parsrarna.
 get_filename_component(FIXTURES_ABS "${CMAKE_CURRENT_SOURCE_DIR}/../sim-fixtures" ABSOLUTE)

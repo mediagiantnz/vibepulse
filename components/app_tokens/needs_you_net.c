@@ -38,34 +38,44 @@ typedef struct {
 } verdict_item;
 
 static QueueHandle_t s_queue;
+/* Logged once, after the first send: the 6 KiB task budget becomes a
+ * measured number instead of a guess. */
+static bool s_stack_logged;
 
-static void enqueue(const verdict_item *item) {
-  if (!s_queue) return;
+/* Returns true only when the item is actually sitting in the sender's queue.
+ * The monitor uses that answer to decide whether the glass may say ON IT;
+ * a dropped verdict must leave the takeover up so the terminal stays the
+ * honest fallback. */
+static bool enqueue(const verdict_item *item) {
+  if (!s_queue) return false;
   /* Non-blocking on purpose: if the sender is wedged on a stalled network, a
    * dropped verdict still falls back to the terminal via the bridge timeout.
    * Better a lost answer than a frozen UI thread. */
-  if (xQueueSend(s_queue, item, 0) != pdTRUE)
+  if (xQueueSend(s_queue, item, 0) != pdTRUE) {
     ESP_LOGW(TAG, "verdict-kön full — hoppar över, terminalen tar över");
+    return false;
+  }
+  return true;
 }
 
-static void needs_you_send_cb(tk_needs_you_verdict verdict,
+static bool needs_you_send_cb(tk_needs_you_verdict verdict,
                               const tk_ir_decision_context *context) {
   const char *name = tk_needs_you_verdict_name(verdict);
-  if (!name || !context || !context->request_id[0]) return;
+  if (!name || !context || !context->request_id[0]) return false;
   if (context->provider != TK_AGENT_PROVIDER_CLAUDE &&
       context->provider != TK_AGENT_PROVIDER_CODEX) {
-    return;
+    return false;
   }
   /* Codex must never fall through to the legacy signature. The parser already
    * enforces this, and this second gate keeps malformed internal calls safe. */
   if (context->provider == TK_AGENT_PROVIDER_CODEX &&
       !context->has_view_sha256) {
     ESP_LOGE(TAG, "Codex-svar saknar vybindning — skickar inte");
-    return;
+    return false;
   }
   if (context->has_view_sha256 &&
       context->view_sha256[TK_PENDING_VIEW_SHA256_CAP - 1] != '\0') {
-    return;
+    return false;
   }
   verdict_item item = {
     .panic = false,
@@ -73,7 +83,7 @@ static void needs_you_send_cb(tk_needs_you_verdict verdict,
     .ts = (uint64_t)time(NULL),
   };
   item.context = *context;
-  enqueue(&item);
+  return enqueue(&item);
 }
 
 void tk_needs_you_send_panic(void) {
@@ -82,7 +92,7 @@ void tk_needs_you_send_panic(void) {
     .ts = (uint64_t)time(NULL),
   };
   memcpy(item.context.request_id, "panic", sizeof "panic");
-  enqueue(&item);
+  (void)enqueue(&item);
 }
 
 __attribute__((weak)) bool tk_interaction_relay_queue_verdict(
@@ -99,6 +109,18 @@ static tk_ir_direct_result post_direct_verdict(const verdict_item *item) {
   char url[128];
   const char *verdict_name = tk_needs_you_verdict_name(item->verdict);
   if (!verdict_name) return TK_IR_DIRECT_HARD_REJECT;
+
+  /* The direct LAN answer carries a wall-clock ts that the tokenserver
+   * holds inside a replay window. An unsynced clock would feed that window
+   * a 1970 timestamp; refuse to send rather than teach the bridge to see
+   * bogus times. UNCERTAIN (not a hard reject) so a relay-bound request
+   * can still travel the encrypted path, which is challenge-bound and
+   * needs no wall clock. */
+  if (!tk_wall_clock_synced((int64_t)item->ts)) {
+    ESP_LOGW(TAG, "klockan är inte synkad, %s skickas inte direkt",
+             item->panic ? "paniken" : verdict_name);
+    return TK_IR_DIRECT_UNCERTAIN;
+  }
 
   if (item->panic) {
     if (tk_needs_you_canonical_message(message, sizeof message,
@@ -172,6 +194,11 @@ static tk_ir_direct_result post_direct_verdict(const verdict_item *item) {
     (void)tk_needs_you_send_should_retry(status); /* documented: never */
   } else {
     ESP_LOGI(TAG, "skickade %s", verdict_name);
+  }
+  if (!s_stack_logged) {
+    s_stack_logged = true;
+    ESP_LOGI(TAG, "needs-you-net stack: minst %u byte fria efter första sändningen",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
   }
   return tk_ir_direct_result_from_http(err == ESP_OK, status);
 }

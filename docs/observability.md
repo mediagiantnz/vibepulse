@@ -105,6 +105,17 @@ repeating deserves attention. What a healthy boot looks like:
   A traceback in this log is a server bug worth filing.
 - Access logging stays muted (a 30 s poll must not fill the file), but
   HTTP-level *errors* log again — the old mute silenced both.
+- **`GET /api/… from <ip> rejected: Host '…' is not an IP literal, a
+  .local name or localhost`**: the DNS-rebinding guard refused a GET
+  (the client got a 421). The panel and `curl localhost` never trigger
+  it; a browser reaching the service through a public name does.
+- **`http <ip>: Request timed out`**: a peer held a connection open for
+  15 s without sending a request line, and its worker slot was
+  reclaimed. One line per such peer; a steady stream means something
+  on the LAN is opening idle sockets to port 8737.
+- **`signal 15: shutting down`**: a SIGTERM (launchctl, Task Scheduler
+  stop) was turned into a clean shutdown with the final max-tracker
+  flush. A restart with no such line before it was a hard kill.
 
 Under launchd (`se.torget.tokenserver.plist`) both streams append to
 **`~/Library/Logs/torget-tokenserver.log`** — visible in Console.app,

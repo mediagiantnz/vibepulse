@@ -9,12 +9,20 @@
  *
  * Samtyckesmodellen ärvs från OTA (docs/ota.md), med en skillnad som är
  * medveten: fönstret kan också öppna sig SJÄLVT efter TG_WIFI_SETUP_AUTO_US
- * utan IP. Det försvagar ingenting — utan nät finns ingen fjärr som kunde
- * ha öppnat det, och en panel på ett hotellrum ska inte kräva att man vet
- * en hemlig gest för att bli användbar igen. Faktorerna är kvar:
+ * utan IP, så en panel på ett hotellrum inte kräver att man vet en hemlig
+ * gest för att bli användbar igen. Var ärlig om vad det betyder: "90 s
+ * utan IP" kan tillverkas utifrån av den som kan hålla stationen borta
+ * från sitt nät (en oautentiserad deauth-flod räcker), så det automatiska
+ * fönstret ska antas gå att öppna på avstånd. Därför får det ALDRIG det
+ * token-härledda lösenordet: det får ett slumpat som bara står på glaset
+ * (tg_wifi_ap_psk_source), och det kan ändå inte göra mer än lägga till ett
+ * nät i listan. Faktorerna är kvar:
  *
- *  1. Fysisk närvaro — accesspunktens lösenord står på glaset. Utan att se
- *     skärmen (eller ha secrets.h på sin Mac) kommer ingen in.
+ *  1. Fysisk närvaro - accesspunktens lösenord står på glaset. För ett
+ *     fönster som öppnats med KEY3-hållet är secrets.h på Macen en lika god
+ *     nyckel (lösenordet härleds ur token); för ett fönster som öppnat sig
+ *     självt finns lösenordet bara på glaset. Den som varken ser skärmen
+ *     eller höll knappen kommer inte in.
  *  2. Tid — fönstret stänger sig självt efter tio minuter, och allt minne
  *     det kostade lämnas tillbaka. Http-servern och accesspunkten existerar
  *     bara medan fönstret är öppet (lata ytan, frysläxan 2026-08-14).

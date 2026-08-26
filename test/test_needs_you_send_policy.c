@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "../components/app_tokens/needs_you_net.h"
 #include "../components/app_tokens/needs_you_send_policy.h"
 
 static int failures;
@@ -30,6 +31,20 @@ int main(void) {
   char key64[65];
   memset(key64, 'a', 64);
   key64[64] = '\0';
+
+  /* The wall-clock gate: an unsynced ESP32 counts from 1970 and is never
+   * <= 0, so the only honest test is the floor. Nothing below it may be
+   * stamped into a direct LAN verdict or used to evaluate a relay expiry. */
+  check("zero is unsynced", !tk_wall_clock_synced(0));
+  check("a negative clock is unsynced", !tk_wall_clock_synced(-1));
+  check("boot-plus-uptime in 1970 is unsynced", !tk_wall_clock_synced(86400));
+  check("one second under the floor is unsynced",
+        !tk_wall_clock_synced(TK_WALL_CLOCK_SYNC_FLOOR_S - 1));
+  check("the floor itself counts as synced",
+        tk_wall_clock_synced(TK_WALL_CLOCK_SYNC_FLOOR_S));
+  check("a real 2026 timestamp is synced", tk_wall_clock_synced(1787097720LL));
+  check("the floor predates this firmware's first release",
+        TK_WALL_CLOCK_SYNC_FLOOR_S < 1786000000LL);
 
   /* Verdict wire names, and nothing sent for an unknown one. */
   expect("approve name",

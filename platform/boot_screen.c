@@ -49,8 +49,16 @@ void torget_boot_screen_create(void) {
 }
 
 void torget_boot_screen_stage(tg_boot_stage stage) {
-  if (!ui.overlay || ui.gone) return;
+  if (!ui.overlay || ui.gone) return; /* billig förkontroll utan lås */
   if (!torget_ui_try_lock(200)) return; /* nästa signal/poll försöker igen */
+  /* Kontrollen igen UNDER låset: WiFi-eventloopen, nättasken och LVGL-
+   * ticken kallar hit oberoende av varandra, och DATA_OK/GIVE_UP river
+   * overlayn. Utan omkontrollen kunde en väntande WIFI_UP-signal styla
+   * ui.steps[] i ett träd som just raderats. */
+  if (!ui.overlay || ui.gone) {
+    torget_ui_unlock();
+    return;
+  }
   switch (stage) {
     case TG_BOOT_WIFI_UP:
       lv_obj_set_style_text_color(ui.steps[0], lv_color_white(), 0);

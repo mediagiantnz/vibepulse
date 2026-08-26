@@ -17,8 +17,12 @@
 #
 # Accesspunktens lösenord härleds ur TG_OTA_TOKEN i secrets.h, samma
 # hemlighet som redan får skriva firmware — därför behöver skriptet inget
-# som står på skärmen. Saknas token är lösenordet slumpat per fönster och
-# står bara på glaset; kör då med:  TG_AP_PASS=<det på skärmen> tools/wifi-here.sh
+# som står på skärmen. Det gäller BARA ett fönster som öppnats med KEY3-
+# hållet (steg 1, andra alternativet). Ett fönster som panelen öppnat själv
+# efter 90 s utan nät får ett slumpat lösenord som bara står på glaset och i
+# QR-koden (ett sådant fönster kan provoceras fram utifrån, och en långlivad
+# hemlighet lämnas aldrig ut till det), och detsamma gäller utan token.
+# Kör då med:  TG_AP_PASS=<det på skärmen> tools/wifi-here.sh
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -95,10 +99,14 @@ done
 [ "$i" -lt 15 ] || { echo "panelen svarar inte på http://$AP_HOST/" >&2; exit 1; }
 
 echo "lämnar över \"$SSID\"..."
-CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+# Lösenordet går in på curl:s stdin ("pass@-" läser och URL-kodar hela
+# stdin), aldrig i argv där varje process på Macen kan läsa det med ps.
+# SSID:t är inget hemligt och URL-kodas som förut; ett tomt lösenord (öppet
+# nät) blir en tom stdin och ett tomt pass-fält, vilket panelen godtar.
+CODE=$(printf '%s' "$PSK" | curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
        -X POST "http://$AP_HOST/join" \
        --data-urlencode "ssid=$SSID" \
-       --data-urlencode "pass=$PSK")
+       --data-urlencode "pass@-")
 
 if [ "$CODE" != "200" ]; then
   echo "panelen avvisade uppgifterna (HTTP $CODE)." >&2

@@ -14,8 +14,10 @@ attention_fonts = (
 )
 
 assert (
-    "#define TK_USAGE_SCREEN_VIEWS (6 + TK_GITHUB_SCREEN_ENABLED + 1)" in header
+    "#define TK_USAGE_SCREEN_VIEWS (7 + TK_GITHUB_SCREEN_ENABLED)" in header
 )
+# Fixed tiles first, the optional GitHub tile last: the default build has
+# seven tiles and VIEW_VALUE must be one of them.
 for enum_literal in (
     "VIEW_CLAUDE_FABLE = 0",
     "VIEW_CLAUDE_ALL = 1",
@@ -23,10 +25,11 @@ for enum_literal in (
     "VIEW_BURN_RATE = 3",
     "VIEW_TRACKER_CLAUDE = 4",
     "VIEW_TRACKER_CODEX = 5",
-    "VIEW_GITHUB = 6",
-    "VIEW_VALUE = 7",
+    "VIEW_VALUE = 6",
+    "VIEW_GITHUB = 7",
 ):
     assert enum_literal in app_header
+assert "_Static_assert(VIEW_VALUE < TK_USAGE_SCREEN_VIEWS" in source
 assert "VIEW_VOLUME" not in app_header
 
 for removed in (

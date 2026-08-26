@@ -21,4 +21,9 @@ export default defineConfig({
       wrangler: { configPath: "./wrangler.jsonc" },
     }),
   ],
+  test: {
+    // deploy.test.mjs is a node:test suite for the deploy guard; it runs
+    // under plain Node from `npm test`, not inside the Workers pool.
+    include: ["test/**/*.test.ts"],
+  },
 });

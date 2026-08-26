@@ -470,6 +470,18 @@ int main(void) {
            "{\"avgPeakPct\":101}");
   check_rejected_untouched("codex avgPeakPct över 100 avvisas", doc, &t);
 
+  /* --- Fientligt djup: CJSON_NESTING_LIMIT=16 i alla tre byggena --- */
+  {
+    char brackets[64] = {0};
+    for (int i = 0; i < 20; i++) brackets[i] = '[';
+    for (int i = 0; i < 20; i++) brackets[20 + i] = ']';
+    char deep_codex[128];
+    snprintf(deep_codex, sizeof deep_codex, "{\"avgPeakPct\":%s}", brackets);
+    build_doc(doc, sizeof doc, "1", "20", "false", "null", claude_full,
+             deep_codex);
+    check_rejected_untouched("20 nivåers nästling avvisas rent", doc, &t);
+  }
+
   if (failures == 0) { printf("OK: alla max-tracker-tester gröna\n"); return 0; }
   printf("%d test föll\n", failures);
   return 1;

@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
 
 #include "../components/app_tokens/usage_presenter.h"
 
@@ -24,16 +23,9 @@ static tk_limit limit(double pct, int reset_min, double delta) {
   return out;
 }
 
-static int64_t local_epoch(int year, int month, int day, int hour, int minute) {
-  struct tm value = {0};
-  value.tm_year = year - 1900;
-  value.tm_mon = month - 1;
-  value.tm_mday = day;
-  value.tm_hour = hour;
-  value.tm_min = minute;
-  value.tm_isdst = -1;
-  return (int64_t)mktime(&value);
-}
+/* 2026-08-08 05:00:00 UTC, a Saturday. A fixed UTC instant, not mktime():
+ * the presenter must give the same bytes whatever TZ the test host has. */
+#define SAT_0500_UTC 1786165200LL
 
 int main(void) {
   tk_tokens tokens = {0};
@@ -77,30 +69,24 @@ int main(void) {
   tk_tokens missing = {0};
   usage_presenter_build_quota_page(&missing, USAGE_QUOTA_CLAUDE_MODEL,
                                    &page);
+  /* No label from the service means no model name from the panel either:
+   * "MODEL · WEEK" claims nothing about WHICH model the week belongs to. */
   check("missing model quota remains truthful",
-        strcmp(page.quota.label, "FABLE · WEEK") == 0 &&
+        strcmp(page.quota.label, "MODEL · WEEK") == 0 &&
         strcmp(page.quota.pct_text, "–") == 0 &&
         strcmp(page.quota.delta_text, "–") == 0 &&
         strcmp(page.quota.reset_short_text, "–") == 0 &&
         !page.quota.has_pct && !page.quota.has_delta);
 
-  usage_detail_page_view details = {0};
-  usage_presenter_build_claude_details(&missing, &details);
-  check("Claude details use stable Fable identity without data",
-        details.row_count == 2 &&
-        strcmp(details.rows[0].label, "FABLE · WEEK") == 0 &&
-        strcmp(details.rows[0].pct_text, "–") == 0);
+  tk_tokens unlabelled = tokens;
+  unlabelled.has_claude_model_week_label = 0;
+  unlabelled.claude_model_week_label[0] = '\0';
+  usage_presenter_build_quota_page(&unlabelled, USAGE_QUOTA_CLAUDE_MODEL,
+                                   &page);
+  check("percent without a label never invents a model name",
+        strcmp(page.quota.label, "MODEL · WEEK") == 0 &&
+        strcmp(page.quota.pct_text, "73%") == 0);
 
-  tk_agent_status metadata = {0};
-  metadata.has_model = true;
-  metadata.has_effort = true;
-  snprintf(metadata.model, sizeof metadata.model, "OPUS 5");
-  snprintf(metadata.effort, sizeof metadata.effort, "ULTRA");
-  char metadata_text[48];
-  usage_presenter_format_agent_metadata(&metadata, metadata_text,
-                                        sizeof metadata_text);
-  check("legacy compact metadata remains available to overlays",
-        strcmp(metadata_text, "OPUS 5 · ULTRA") == 0);
   check("fresh quota without agent context is live",
         strcmp(usage_presenter_quota_status_text(true, false, ""),
                "LIVE") == 0);
@@ -127,9 +113,11 @@ int main(void) {
   forecasts.claude_forecast.pace_factor = 1.4;
   forecasts.codex_forecast.state = TK_FORECAST_EXHAUSTS;
   forecasts.codex_forecast.has_at_epoch = 1;
-  forecasts.codex_forecast.at_epoch = local_epoch(2026, 8, 8, 5, 0);
+  forecasts.codex_forecast.at_epoch = SAT_0500_UTC;
   forecasts.codex_forecast.has_offset_min = 1;
   forecasts.codex_forecast.offset_min = -540;
+  forecasts.has_tz_offset_min = 1;
+  forecasts.tz_offset_min = 120; /* the host is on UTC+2 */
 
   usage_forecast_page_view forecast_page = {0};
   usage_presenter_build_forecasts(&forecasts, &forecast_page);
@@ -141,10 +129,51 @@ int main(void) {
         strcmp(forecast_page.rows[0].headline, "SPEED UP") == 0 &&
         strcmp(forecast_page.rows[0].detail,
                "1.4× CURRENT PACE TO MAX OUT") == 0);
-  check("early exhaustion leads with timing",
+  /* The clock is the HOST's local time: 05:00 UTC on a UTC+2 host is 07:00.
+   * The device itself has no TZ, so the old localtime() showed UTC. */
+  check("early exhaustion leads with timing in host-local time",
         strcmp(forecast_page.rows[1].headline, "9H EARLY") == 0 &&
         strcmp(forecast_page.rows[1].detail,
-               "RUNS OUT SAT 05:00") == 0);
+               "RUNS OUT SAT 07:00") == 0);
+
+  forecasts.tz_offset_min = -300; /* a UTC-5 host: same instant, Saturday 00:00 */
+  usage_presenter_build_forecasts(&forecasts, &forecast_page);
+  check("negative host offsets cross midnight correctly",
+        strcmp(forecast_page.rows[1].detail, "RUNS OUT SAT 00:00") == 0);
+
+  forecasts.tz_offset_min = -360; /* UTC-6: the day flips to Friday */
+  usage_presenter_build_forecasts(&forecasts, &forecast_page);
+  check("host offsets can move the weekday",
+        strcmp(forecast_page.rows[1].detail, "RUNS OUT FRI 23:00") == 0);
+
+  /* Unknown offset: never a clock time (it would be UTC in local clothing),
+   * but the payload still says when: reset in 2210 min, exhausts 540 min
+   * before that -> 1670 min -> 1D 3H. */
+  forecasts.has_tz_offset_min = 0;
+  forecasts.tz_offset_min = 0;
+  usage_presenter_build_forecasts(&forecasts, &forecast_page);
+  check("unknown host offset shows a relative time, never a UTC clock",
+        strcmp(forecast_page.rows[1].headline, "9H EARLY") == 0 &&
+        strcmp(forecast_page.rows[1].detail, "RUNS OUT IN 1D 3H") == 0);
+
+  forecasts.codex_week = limit(35, 600, 5);
+  usage_presenter_build_forecasts(&forecasts, &forecast_page);
+  check("relative form uses hours and minutes under a day",
+        strcmp(forecast_page.rows[1].detail, "RUNS OUT IN 1H 00M") == 0);
+
+  forecasts.codex_week = limit(35, 30, 5);
+  usage_presenter_build_forecasts(&forecasts, &forecast_page);
+  check("an exhaustion already due reads as now, not as a negative time",
+        strcmp(forecast_page.rows[1].detail, "RUNS OUT NOW") == 0);
+
+  forecasts.codex_week.has_reset = 0;
+  usage_presenter_build_forecasts(&forecasts, &forecast_page);
+  check("no reset and no offset still says something true",
+        strcmp(forecast_page.rows[1].detail, "RUNS OUT BEFORE RESET") == 0);
+
+  forecasts.codex_week = limit(35, 2210, 5);
+  forecasts.has_tz_offset_min = 1;
+  forecasts.tz_offset_min = 120;
 
   forecasts.claude_forecast.pace_factor = 1.04;
   usage_presenter_build_forecasts(&forecasts, &forecast_page);

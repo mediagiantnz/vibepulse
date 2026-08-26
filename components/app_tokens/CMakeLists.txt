@@ -1,6 +1,6 @@
 set(TK_APP_TOKEN_SRCS
        "app.c" "tokens_parse.c" "usage_presenter.c" "usage_screen.c"
-       "agent_status_parse.c" "agent_usage.c"
+       "agent_status_parse.c"
        "agent_monitor_policy.c" "usage_live_policy.c" "agent_completion_policy.c"
        "needs_you_policy.c" "needs_you_send_policy.c"
        "interaction_relay_policy.c"

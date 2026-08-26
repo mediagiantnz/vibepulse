@@ -1953,6 +1953,7 @@ class HandlerTests(unittest.TestCase):
     @staticmethod
     def _request(path, agent_status=None):
         handler = object.__new__(tokenserver.Handler)
+        handler.headers = {"Host": "localhost"}
         handler.path = path
         handler.agent_status = agent_status
         sent = []

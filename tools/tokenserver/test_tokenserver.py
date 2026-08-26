@@ -16,7 +16,7 @@ import threading
 import time
 import unittest
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timedelta, timezone, tzinfo
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from unittest import mock
@@ -1165,9 +1165,12 @@ class CodexLimitLogTests(unittest.TestCase):
             with mock.patch.object(
                     Path, "read_text",
                     side_effect=AssertionError("full file read is forbidden")):
-                found = tokenserver._read_latest_rate_limits(path)
+                general, session = tokenserver._read_codex_observations(
+                    path, now_ts=1_800_000_000)
 
-        self.assertEqual(found, rate_limits)
+        self.assertEqual(general["pct"], 35.0)
+        self.assertEqual(general["reset_at"], 1_900_000_000)
+        self.assertIsNone(session)
 
     def test_reverse_scan_stops_at_configured_byte_limit(self):
         rate_limits = self._limits(35.0)
@@ -1177,10 +1180,11 @@ class CodexLimitLogTests(unittest.TestCase):
                 json.dumps(self._event(rate_limits)).encode() + b"\n" +
                 b'{"type":"noise"}\n' * 10_000)
 
-            found = tokenserver._read_latest_rate_limits(
-                path, block_size=4096, max_bytes=64 * 1024)
+            found = tokenserver._read_codex_observations(
+                path, now_ts=1_800_000_000, block_size=4096,
+                max_bytes=64 * 1024)
 
-        self.assertIsNone(found)
+        self.assertEqual(found, (None, None))
 
     def test_reverse_scan_never_reads_more_than_one_mebibyte(self):
         rate_limits = self._limits(35.0)
@@ -1190,10 +1194,11 @@ class CodexLimitLogTests(unittest.TestCase):
                 json.dumps(self._event(rate_limits)).encode() + b"\n" +
                 b'{"type":"noise"}\n' * 80_000)
 
-            found = tokenserver._read_latest_rate_limits(
-                path, max_bytes=2 * tokenserver.CODEX_LIMIT_SCAN_BYTES)
+            found = tokenserver._read_codex_observations(
+                path, now_ts=1_800_000_000,
+                max_bytes=2 * tokenserver.CODEX_LIMIT_SCAN_BYTES)
 
-        self.assertIsNone(found)
+        self.assertEqual(found, (None, None))
 
     def test_only_expected_rollout_event_envelope_is_accepted(self):
         limits = self._limits(46.0)
@@ -1209,14 +1214,19 @@ class CodexLimitLogTests(unittest.TestCase):
                 "type": "token_count", "content": json.dumps({
                     "rate_limits": limits})}},
         ]
+        # Every impostor carries a valid timestamp, so the envelope rule
+        # (not a missing observation time) is what rejects it.
+        for row in impostors:
+            row["timestamp"] = "2026-08-07T10:00:00Z"
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "rollout.jsonl"
             path.write_text("".join(json.dumps(row) + "\n"
                                     for row in impostors))
 
-            found = tokenserver._read_latest_rate_limits(path)
+            found = tokenserver._read_codex_observations(
+                path, now_ts=1_800_000_000)
 
-        self.assertIsNone(found)
+        self.assertEqual(found, (None, None))
 
     def test_missing_or_non_numeric_window_is_never_classified(self):
         for value in (None, "10080", True):
@@ -1252,20 +1262,29 @@ class CodexLimitLogTests(unittest.TestCase):
                     now_ts=1_800_000_000))
 
     def test_newer_named_quota_does_not_hide_older_general_quota(self):
+        now_ts = 1_800_000_000
+
+        def stamp(age_s):
+            return datetime.fromtimestamp(
+                now_ts - age_s, tz=timezone.utc).isoformat().replace(
+                    "+00:00", "Z")
+
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             older = root / "rollout-older.jsonl"
             newer = root / "rollout-newer.jsonl"
+            # Both inside CODEX_ROLLOUT_FRESH_S: this test is about the
+            # named-vs-general precedence, not the freshness bound.
             older.write_text(json.dumps(self._event(
-                self._limits(46.0), "2026-08-07T10:00:00Z")) + "\n")
+                self._limits(46.0), stamp(120))) + "\n")
             newer.write_text(json.dumps(self._event(self._limits(
                 0.0, name="GPT-5.3-Codex-Spark", limit_id="spark"),
-                "2026-08-07T11:00:00Z")) + "\n")
+                stamp(60))) + "\n")
             os.utime(older, (100, 100))
             os.utime(newer, (200, 200))
             with mock.patch.object(tokenserver, "CODEX_SESSIONS", root), \
                     mock.patch.object(tokenserver.time, "time",
-                                      return_value=1_800_000_000):
+                                      return_value=now_ts):
                 found = tokenserver._scan_codex_limits()
 
         self.assertEqual(found["codexWeekPct"], 46.0)
@@ -2315,6 +2334,7 @@ class BoundedHTTPServerTests(unittest.TestCase):
 class HandlerPrivacyTests(unittest.TestCase):
     def _handler(self, path):
         handler = tokenserver.Handler.__new__(tokenserver.Handler)
+        handler.headers = {"Host": "localhost"}
         handler.path = path
         handler.projects_dir = Path("/private/source/path")
         handler.agent_status = mock.Mock()
@@ -2436,6 +2456,7 @@ class HandlerErrorLoggingTests(unittest.TestCase):
 
     def _handler(self, path):
         handler = tokenserver.Handler.__new__(tokenserver.Handler)
+        handler.headers = {"Host": "localhost"}
         handler.path = path
         handler.projects_dir = Path("/private/source/path")
         handler.agent_status = mock.Mock()
@@ -2522,6 +2543,7 @@ class UsageComputeHealthTests(unittest.TestCase):
             self.assertEqual(tokenserver._last_result, {"v": 1})
 
             handler = tokenserver.Handler.__new__(tokenserver.Handler)
+            handler.headers = {"Host": "localhost"}
             handler.path = "/"
             handler._send = mock.Mock()
             handler.do_GET()
@@ -2546,6 +2568,7 @@ class UsageComputeHealthTests(unittest.TestCase):
             self.assertEqual(tokenserver._last_result, {"v": 2})
 
             handler = tokenserver.Handler.__new__(tokenserver.Handler)
+            handler.headers = {"Host": "localhost"}
             handler.path = "/"
             handler._send = mock.Mock()
             handler.do_GET()
@@ -3017,6 +3040,7 @@ class MaxTrackerEndpointTests(unittest.TestCase):
 
     def _handler(self, max_tracker_store, plans=None):
         handler = tokenserver.Handler.__new__(tokenserver.Handler)
+        handler.headers = {"Host": "localhost"}
         handler.path = "/api/max-tracker"
         handler.projects_dir = Path("/private/source/path")
         handler.agent_status = mock.Mock()
@@ -3087,6 +3111,7 @@ class MaxTrackerEndpointTests(unittest.TestCase):
 
     def test_root_listing_includes_max_tracker(self):
         handler = tokenserver.Handler.__new__(tokenserver.Handler)
+        handler.headers = {"Host": "localhost"}
         handler.path = "/"
         handler.agent_status = mock.Mock()
         handler._send = mock.Mock()
@@ -3863,6 +3888,7 @@ class SourceFingerprintTests(unittest.TestCase):
         self.assertEqual(first, tokenserver._read_source_fingerprint())
 
         handler = tokenserver.Handler.__new__(tokenserver.Handler)
+        handler.headers = {"Host": "localhost"}
         handler.path = "/"
         handler._send = mock.Mock()
         handler.do_GET()
@@ -3956,6 +3982,688 @@ class ProbeTransitionLogTests(unittest.TestCase):
                 tokenserver._refresh_limits()
             self.assertIn("usage_http_401 -> usage_http_200 + ok",
                           "\n".join(captured.output))
+
+
+class _AutumnZone(tzinfo):
+    """An NZ-shaped zone with a DST transition INSIDE April 2026: +13
+    (summer) until 2026-04-05 03:00 local, +12 afterwards. Deliberately a
+    custom tzinfo rather than the machine's, so the boundary tests mean the
+    same thing on a UTC CI runner and an NZ laptop."""
+
+    _TRANSITION = datetime(2026, 4, 5, 3, 0)
+
+    def _summer(self, dt):
+        return dt.replace(tzinfo=None) < self._TRANSITION
+
+    def utcoffset(self, dt):
+        return timedelta(hours=13 if self._summer(dt) else 12)
+
+    def dst(self, dt):
+        return timedelta(hours=1 if self._summer(dt) else 0)
+
+    def tzname(self, dt):
+        return "NZDT" if self._summer(dt) else "NZST"
+
+
+def _snapshot_with(now_ts, claude=None, codex=None, store=None,
+                   history=None):
+    """get_snapshot with every upstream stubbed, sharing the fixture shape
+    of UsageSnapshotTests/MaxTrackerLiveHookTests."""
+    base = {
+        "v": 1, "dayTokens": 0, "dayTokensPerHour": 0,
+        "daySessions": 0, "monthTokens": 0,
+        "at": "2026-08-07T12:00:00+02:00",
+    }
+    with tempfile.TemporaryDirectory() as temp_dir, \
+            mock.patch.object(tokenserver, "_persist_quota_records_async"), \
+            mock.patch.object(tokenserver, "_compute", return_value=base), \
+            mock.patch.object(tokenserver, "get_limits",
+                              return_value=claude or {}), \
+            mock.patch.object(tokenserver, "_read_codex_limits",
+                              return_value=codex or {}):
+        tokenserver._last_result = None
+        tokenserver._last_computed = 0.0
+        return tokenserver.get_snapshot(
+            Path("/unused"),
+            history=StubHistory() if history is None else history,
+            now_ts=now_ts,
+            quota_cache=QuotaCache(Path(temp_dir) / "quota.json",
+                                   now=lambda: now_ts),
+            max_tracker_store=store)
+
+
+class ResolveQuotasTests(unittest.TestCase):
+    """resolve_quotas is the pure half of get_snapshot: every window it
+    publishes, nothing written anywhere."""
+
+    def test_resolves_every_window_from_the_readings_alone(self):
+        now_ts = 1_800_000_000
+        cache = mock.Mock()
+        cache.latest.return_value = None
+        claude = {
+            "sessionPct": 21.0,
+            "sessionResetAt": now_ts + 3600,
+            "weekPct": 47.0,
+            "weekResetAt": now_ts + 300 * 60,
+            "weekObservedAt": now_ts - 5,
+            "weekIdentity": tokenserver._quota_identity(
+                "claude", "general_weekly"),
+            "modelPct": 73.0,
+            "modelResetAt": now_ts + 300 * 60,
+            "modelObservedAt": now_ts - 4,
+            "modelIdentity": tokenserver._quota_identity(
+                "claude", "model_weekly"),
+            "modelLabel": "FABLE · WEEK",
+        }
+        codex = {
+            "codexSessionPct": 12.0,
+            "codexSessionResetMin": 90,
+            "codexSessionWindowMinutes": 300,
+            "codexWeekPct": 35.0,
+            "codexWeekResetAt": now_ts + 300 * 60,
+            "codexWeekObservedAt": now_ts - 3,
+            "codexWeekIdentity": tokenserver._quota_identity(
+                "codex", "general_weekly", "synthetic"),
+        }
+
+        quotas = tokenserver.resolve_quotas(claude, codex, cache, now_ts)
+
+        self.assertEqual(quotas["session"], {
+            "pct": 21.0, "reset_at": now_ts + 3600, "reset_min": 60})
+        self.assertEqual(quotas["week"]["pct"], 47.0)
+        self.assertTrue(quotas["week"]["live"])
+        self.assertEqual(quotas["week"]["observed_at"], now_ts - 5)
+        self.assertEqual(quotas["model"]["label"], "FABLE · WEEK")
+        self.assertEqual(quotas["model"]["observed_at"], now_ts - 4)
+        self.assertEqual(quotas["codex_week"]["pct"], 35.0)
+        self.assertEqual(quotas["codex_week"]["observed_at"], now_ts - 3)
+        self.assertEqual(quotas["codex_session"], {
+            "pct": 12.0, "reset_min": 90, "window_minutes": 300})
+        # The cache is at most read (never here: every window was live).
+        self.assertLessEqual(
+            {call[0] for call in cache.method_calls}, {"latest"})
+
+    def test_a_stale_window_reads_the_cache_and_nothing_else(self):
+        now_ts = 1_800_000_000
+        cache = mock.Mock()
+        cache.latest.return_value = None
+        tokenserver.resolve_quotas({"weekPct": 47.0}, {}, cache, now_ts)
+        self.assertEqual(
+            {call[0] for call in cache.method_calls}, {"latest"})
+
+    def test_a_session_without_a_future_reset_is_absent_entirely(self):
+        now_ts = 1_800_000_000
+        cache = mock.Mock()
+        cache.latest.return_value = None
+        for claude in ({"sessionPct": 21.0},
+                       {"sessionPct": 21.0, "sessionResetAt": now_ts - 1},
+                       {"sessionResetAt": now_ts + 60}):
+            with self.subTest(claude=claude):
+                quotas = tokenserver.resolve_quotas(claude, {}, cache, now_ts)
+                self.assertEqual(quotas["session"], {
+                    "pct": None, "reset_at": None, "reset_min": None})
+
+    def test_snapshot_publishes_exactly_what_resolve_quotas_resolved(self):
+        now_ts = 1_800_000_000
+        claude = {
+            "sessionPct": 21.0,
+            "sessionResetAt": now_ts + 3600,
+            "weekPct": 47.0,
+            "weekResetAt": now_ts + 300 * 60,
+            "weekObservedAt": now_ts,
+            "weekIdentity": tokenserver._quota_identity(
+                "claude", "general_weekly"),
+        }
+        codex = {"codexSessionPct": 12.0, "codexSessionResetMin": 90}
+        resolved = []
+        real_resolve = tokenserver.resolve_quotas
+
+        def spy(*args, **kwargs):
+            resolved.append(real_resolve(*args, **kwargs))
+            return resolved[-1]
+
+        with mock.patch.object(tokenserver, "resolve_quotas",
+                               side_effect=spy):
+            snapshot = _snapshot_with(now_ts, claude=claude, codex=codex)
+        self.assertEqual(len(resolved), 1)
+        quotas = resolved[0]
+        self.assertEqual(snapshot["claudeSessionPct"],
+                         quotas["session"]["pct"])
+        self.assertEqual(snapshot["claudeSessionResetMin"],
+                         quotas["session"]["reset_min"])
+        self.assertEqual(snapshot["claudeWeekPct"], quotas["week"]["pct"])
+        self.assertEqual(snapshot["claudeWeekObservedAt"],
+                         quotas["week"]["observed_at"])
+        self.assertEqual(snapshot["codexSessionPct"],
+                         quotas["codex_session"]["pct"])
+        self.assertEqual(snapshot["codexSessionResetMin"],
+                         quotas["codex_session"]["reset_min"])
+        self.assertIsNone(snapshot["codexWeekPct"])
+
+
+class HostileTranscriptLineTests(unittest.TestCase):
+    """A transcript row is someone else's unversioned output: a row whose
+    shape is wrong must be skipped, never allowed to raise out of _compute
+    (which froze /api/tokens with usageComputeOk=false until the file aged
+    out of the month)."""
+
+    def setUp(self):
+        self.previous_cache = tokenserver._file_cache
+        tokenserver._file_cache = {}
+
+    def tearDown(self):
+        tokenserver._file_cache = self.previous_cache
+
+    @staticmethod
+    def _good(message_id, tokens):
+        return json.dumps({
+            "timestamp": datetime.now().astimezone().isoformat(),
+            "sessionId": "session-a",
+            "requestId": f"request-{message_id}",
+            "message": {"id": message_id, "usage": {"input_tokens": tokens}},
+        })
+
+    def test_hostile_rows_are_skipped_and_the_good_rows_still_count(self):
+        now_iso = datetime.now().astimezone().isoformat()
+        hostile = [
+            "[]",                                   # a list, not a dict
+            "null",
+            "42",
+            '"just a string"',
+            json.dumps({"timestamp": 1_800_000_000,  # numeric timestamp
+                        "message": {"usage": {"input_tokens": 3}}}),
+            json.dumps({"timestamp": now_iso,
+                        "message": {"usage": "lots"}}),  # string usage
+            json.dumps({"timestamp": now_iso,
+                        "message": ["usage"]}),  # list message
+            json.dumps({"timestamp": now_iso,
+                        "message": {"usage": {"input_tokens": "5"}}}),
+            json.dumps({"timestamp": now_iso,
+                        "message": {"usage": {"input_tokens": None,
+                                              "output_tokens": [1]}}}),
+            json.dumps({"timestamp": now_iso,
+                        "message": {"usage": {"input_tokens": True}}}),
+            json.dumps({"timestamp": ["2026"],
+                        "message": {"usage": {"input_tokens": 3}}}),
+            json.dumps({"timestamp": now_iso, "sessionId": "session-a",
+                        "message": {"usage": {"input_tokens": 1}, "id": 5},
+                        "requestId": 7}),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            projects = Path(temp_dir)
+            (projects / "session.jsonl").write_text(
+                self._good("a", 5) + "\n" + "\n".join(hostile) + "\n" +
+                self._good("b", 7) + "\n", encoding="utf-8")
+
+            result = tokenserver._compute(projects)
+
+        # 5 + 7 from the well-formed rows, plus the 1 token from the row
+        # whose id/requestId are merely the wrong type (that row is a real
+        # usage record; only its dedup key is unusable).
+        self.assertEqual(result["dayTokens"], 13)
+        self.assertEqual(result["daySessions"], 1)
+
+
+class TzOffsetMinTests(unittest.TestCase):
+    """tzOffsetMin: the host's current UTC offset in whole minutes so the
+    panel can render reset times in local time instead of UTC."""
+
+    def test_offset_minutes_from_an_aware_datetime(self):
+        for hours, expected in ((12, 720), (13, 780), (2, 120),
+                                (-3.5, -210), (0, 0), (5.75, 345)):
+            with self.subTest(hours=hours):
+                moment = datetime(2026, 8, 7, 12, tzinfo=timezone(
+                    timedelta(hours=hours)))
+                self.assertEqual(
+                    tokenserver._tz_offset_minutes(moment), expected)
+
+    def test_naive_datetime_yields_none(self):
+        self.assertIsNone(
+            tokenserver._tz_offset_minutes(datetime(2026, 8, 7, 12)))
+
+    def test_snapshot_publishes_the_hosts_offset_as_an_int(self):
+        now_ts = 1_800_000_000
+        expected = round(datetime.fromtimestamp(now_ts).astimezone()
+                         .utcoffset().total_seconds() / 60)
+
+        snapshot = _snapshot_with(now_ts)
+
+        self.assertIs(type(snapshot["tzOffsetMin"]), int)
+        self.assertEqual(snapshot["tzOffsetMin"], expected)
+        self.assertGreaterEqual(snapshot["tzOffsetMin"], -12 * 60)
+        self.assertLessEqual(snapshot["tzOffsetMin"], 14 * 60)
+
+    def test_snapshot_omits_the_field_when_the_offset_is_unknown(self):
+        with mock.patch.object(tokenserver, "_tz_offset_minutes",
+                               return_value=None):
+            snapshot = _snapshot_with(1_800_000_000)
+
+        self.assertNotIn("tzOffsetMin", snapshot)
+
+
+class MaxTrackerDirtyOnlyOnChangeTests(unittest.TestCase):
+    """max-tracker.json (400 days of state) is pruned, serialised and
+    fsynced on every dirty mark: an unchanged observation must not mark."""
+
+    def test_identical_quota_observations_save_exactly_once(self):
+        now_ts = 1_800_000_000
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = MaxTrackerStore(root / "max-tracker.json",
+                                    root / "codex", root / "claude")
+            claude = {
+                "sessionPct": 21.0,
+                "sessionResetAt": now_ts + 3600,
+                "weekPct": 47.0,
+                "weekResetAt": now_ts + 300 * 60,
+                "weekObservedAt": now_ts,
+                "weekIdentity": tokenserver._quota_identity(
+                    "claude", "general_weekly"),
+            }
+            with mock.patch.object(
+                    tokenserver, "_mark_max_tracker_dirty") as dirty:
+                _snapshot_with(now_ts, claude=claude, store=store)
+                _snapshot_with(now_ts, claude=claude, store=store)
+
+        self.assertEqual(dirty.call_count, 1)
+
+    def test_a_higher_peak_marks_dirty_again(self):
+        now_ts = 1_800_000_000
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = MaxTrackerStore(root / "max-tracker.json",
+                                    root / "codex", root / "claude")
+            with mock.patch.object(
+                    tokenserver, "_mark_max_tracker_dirty") as dirty:
+                _snapshot_with(now_ts, claude={
+                    "sessionPct": 21.0, "sessionResetAt": now_ts + 3600},
+                    store=store)
+                _snapshot_with(now_ts, claude={
+                    "sessionPct": 30.0, "sessionResetAt": now_ts + 3600},
+                    store=store)
+
+        self.assertEqual(dirty.call_count, 2)
+
+    def test_volume_marks_dirty_only_when_records_were_added(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = MaxTrackerStore(root / "max-tracker.json",
+                                    root / "codex", root / "claude")
+            projects = root / "projects"
+            projects.mkdir()
+            (projects / "session.jsonl").write_text(json.dumps({
+                "timestamp": datetime.now().astimezone().isoformat(),
+                "sessionId": "s", "requestId": "r",
+                "message": {"id": "m", "usage": {"input_tokens": 5}},
+            }) + "\n", encoding="utf-8")
+            previous = tokenserver._file_cache
+            tokenserver._file_cache = {}
+            try:
+                with mock.patch.object(
+                        tokenserver, "_mark_max_tracker_dirty") as dirty:
+                    tokenserver._compute(projects, store)
+                    tokenserver._compute(projects, store)
+            finally:
+                tokenserver._file_cache = previous
+
+        self.assertEqual(dirty.call_count, 1)
+
+
+class LocalBoundaryDstTests(unittest.TestCase):
+    """The month/day boundaries are LOCAL midnights. ``astimezone()`` hands
+    out a fixed-offset ``now``, so ``now.replace(day=1)`` keeps today's
+    offset and lands an hour off whenever the 1st sat on the other side of
+    a DST transition."""
+
+    def _fixed_now(self, *parts, hours):
+        return datetime(*parts, tzinfo=timezone(timedelta(hours=hours)))
+
+    def test_month_start_carries_the_first_days_offset(self):
+        zone = _AutumnZone()
+        now = self._fixed_now(2026, 4, 20, 12, hours=12)  # after the change
+        with mock.patch.object(
+                tokenserver, "_localize",
+                lambda naive: naive.replace(tzinfo=zone)):
+            start = tokenserver._local_month_start(now)
+
+        expected = datetime(2026, 4, 1, tzinfo=timezone(timedelta(hours=13)))
+        self.assertEqual(start.timestamp(), expected.timestamp())
+        self.assertEqual(start.utcoffset(), timedelta(hours=13))
+
+    def test_day_start_carries_the_offset_in_force_at_midnight(self):
+        zone = _AutumnZone()
+        now = self._fixed_now(2026, 4, 5, 12, hours=12)  # transition day
+        with mock.patch.object(
+                tokenserver, "_localize",
+                lambda naive: naive.replace(tzinfo=zone)):
+            start = tokenserver._local_day_start(now)
+
+        expected = datetime(2026, 4, 5, tzinfo=timezone(timedelta(hours=13)))
+        self.assertEqual(start.timestamp(), expected.timestamp())
+
+    def test_default_localize_interprets_naive_as_the_machines_local_time(self):
+        naive = datetime(2026, 8, 7, 0, 0)
+        self.assertEqual(tokenserver._localize(naive).timestamp(),
+                         naive.astimezone().timestamp())
+        self.assertIsNotNone(tokenserver._localize(naive).tzinfo)
+
+
+class CodexRolloutFreshnessTests(unittest.TestCase):
+    """The rollout fallback republished ANY observation whose reset lay in
+    the future as codexWeekStale:false, hours after Codex last wrote it."""
+
+    @staticmethod
+    def _event(pct, timestamp):
+        return {
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": None,
+                        "rate_limits": {
+                            "limit_id": "synthetic-general",
+                            "primary": {"used_percent": pct,
+                                        "window_minutes": 10080,
+                                        "resets_at": 1_900_000_000}}},
+        }
+
+    def _scan(self, age_s):
+        now_ts = 1_800_000_000
+        observed = datetime.fromtimestamp(
+            now_ts - age_s, tz=timezone.utc).isoformat().replace(
+                "+00:00", "Z")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "rollout-a.jsonl").write_text(
+                json.dumps(self._event(46.0, observed)) + "\n")
+            with mock.patch.object(tokenserver, "CODEX_SESSIONS", root), \
+                    mock.patch.object(tokenserver.time, "time",
+                                      return_value=now_ts):
+                return tokenserver._scan_codex_limits(), now_ts
+
+    def test_recent_fallback_observation_is_live(self):
+        found, now_ts = self._scan(age_s=5 * 60)
+        self.assertEqual(found["codexWeekPct"], 46.0)
+        self.assertFalse(found["codexWeekStale"])
+        self.assertEqual(found["codexWeekObservedAt"], now_ts - 5 * 60)
+
+    def test_old_fallback_observation_is_stale(self):
+        found, now_ts = self._scan(
+            age_s=tokenserver.CODEX_ROLLOUT_FRESH_S + 60)
+        self.assertEqual(found["codexWeekPct"], 46.0)
+        self.assertTrue(found["codexWeekStale"])
+        self.assertEqual(found["codexWeekObservedAt"],
+                         now_ts - tokenserver.CODEX_ROLLOUT_FRESH_S - 60)
+
+    def test_freshness_bound_is_minutes_not_hours(self):
+        self.assertGreaterEqual(tokenserver.CODEX_ROLLOUT_FRESH_S, 5 * 60)
+        self.assertLessEqual(tokenserver.CODEX_ROLLOUT_FRESH_S, 30 * 60)
+
+    def test_stale_fallback_is_served_stale_and_never_recorded(self):
+        now_ts = 1_800_000_000
+        store = mock.Mock()
+        history = StubHistory()
+        codex = {
+            "codexWeekPct": 46.0,
+            "codexWeekResetAt": now_ts + 300 * 60,
+            "codexWeekObservedAt": now_ts - 3600,
+            "codexWeekIdentity": tokenserver._quota_identity(
+                "codex", "general_weekly", "synthetic"),
+            "codexWeekStale": True,
+            "codexWeekWindowMinutes": 10080,
+        }
+        with mock.patch.object(
+                tokenserver, "_persist_quota_records_async") as persist:
+            snapshot = _snapshot_with(now_ts, codex=codex, store=store,
+                                      history=history)
+
+        self.assertEqual(snapshot["codexWeekPct"], 46.0)
+        self.assertTrue(snapshot["codexWeekStale"])
+        self.assertEqual(snapshot["codexWeekObservedAt"], now_ts - 3600)
+        self.assertEqual(snapshot["codexWeekResetMin"], 300)
+        self.assertEqual(history.record_calls, [])
+        for call in store.observe_quota.call_args_list:
+            self.assertNotEqual(call.args[0], "codex")
+        # Nothing stale ever reaches the on-disk quota cache either.
+        for call in persist.call_args_list:
+            self.assertEqual([r for r in call.args[1] if r is not None], [])
+
+    def test_history_samples_carry_the_observation_time_not_now(self):
+        now_ts = 1_800_000_000
+        history = StubHistory()
+        _snapshot_with(now_ts, claude={
+            "sessionPct": 21.0,
+            "sessionResetAt": now_ts + 3600,
+            "weekPct": 47.0,
+            "weekResetAt": now_ts + 300 * 60,
+            "weekObservedAt": now_ts - 200,
+            "weekIdentity": tokenserver._quota_identity(
+                "claude", "general_weekly"),
+        }, codex={
+            "codexWeekPct": 35.0,
+            "codexWeekResetAt": now_ts + 300 * 60,
+            "codexWeekObservedAt": now_ts - 90,
+            "codexWeekIdentity": tokenserver._quota_identity(
+                "codex", "general_weekly", "synthetic"),
+        }, history=history)
+
+        recorded = {(provider, window): at
+                    for provider, window, _pct, _reset, at
+                    in history.record_calls}
+        self.assertEqual(recorded[("claude", "week")], now_ts - 200)
+        self.assertEqual(recorded[("codex", "week")], now_ts - 90)
+        # The 5 h session window has no observation time of its own.
+        self.assertEqual(recorded[("claude", "session")], now_ts)
+
+
+class HostHeaderGuardTests(unittest.TestCase):
+    """GET endpoints validate Host: a DNS-rebinding page on the LAN
+    resolves its own hostname to the Mac, and the only thing that
+    distinguishes its fetch from the panel's is the Host header."""
+
+    def _handler(self, host, path="/api/agent-status"):
+        handler = tokenserver.Handler.__new__(tokenserver.Handler)
+        handler.path = path
+        handler.headers = {} if host is None else {"Host": host}
+        handler.client_address = ("192.168.1.20", 50000)
+        handler.address_string = lambda: "192.168.1.20"
+        handler.projects_dir = Path("/unused")
+        handler.agent_status = mock.Mock()
+        handler.agent_status.snapshot.return_value = {"v": 2, "agents": []}
+        handler.interaction_store = None
+        handler._send = mock.Mock()
+        return handler
+
+    def test_panel_style_hosts_are_served(self):
+        for host in ("192.168.1.50:8737", "192.168.1.50", "10.0.0.7:80",
+                     "[fe80::1]:8737", "[::1]", "[2001:db8::10]:8737",
+                     "andys-mac.local:8737", "Andys-Mac.local",
+                     "andys-mac.local.", "localhost:8737", "localhost",
+                     "LOCALHOST"):
+            with self.subTest(host=host):
+                handler = self._handler(host)
+                handler.do_GET()
+                code = handler._send.call_args.args[0]
+                self.assertEqual(code, 200)
+                handler.agent_status.snapshot.assert_called_once()
+
+    def test_other_hosts_are_rejected_before_any_payload_is_built(self):
+        for host in (None, "", "evil.example.com:8737", "evil.example.com",
+                     "192.168.1.50:8737:1", "local", "x.local.evil.com",
+                     "andys-mac.local:notaport", "[::1", "fe80::1:8737",
+                     "andys-mac.lan:8737", "andys mac.local"):
+            with self.subTest(host=host):
+                handler = self._handler(host)
+                with self.assertLogs("tokenserver", level="WARNING"):
+                    handler.do_GET()
+                code, payload = handler._send.call_args.args
+                self.assertEqual(code, 421)
+                self.assertIn("error", payload)
+                handler.agent_status.snapshot.assert_not_called()
+
+    def test_two_host_headers_are_rejected(self):
+        handler = self._handler("192.168.1.50")
+        handler.headers = mock.Mock()
+        handler.headers.get_all.return_value = ["192.168.1.50", "localhost"]
+        with self.assertLogs("tokenserver", level="WARNING"):
+            handler.do_GET()
+        self.assertEqual(handler._send.call_args.args[0], 421)
+
+    def test_every_get_route_is_guarded(self):
+        for path in ("/api/tokens", "/api/max-tracker", "/api/github", "/",
+                     "/api/agent-status", "/nope"):
+            with self.subTest(path=path):
+                handler = self._handler("evil.example.com", path=path)
+                with mock.patch.object(tokenserver, "get_snapshot") as snap, \
+                        self.assertLogs("tokenserver", level="WARNING"):
+                    handler.do_GET()
+                self.assertEqual(handler._send.call_args.args[0], 421)
+                snap.assert_not_called()
+
+
+class ShutdownSignalTests(unittest.TestCase):
+    """launchctl and Task Scheduler stop the service with SIGTERM, which
+    skipped main()'s finally (and the final max-tracker save)."""
+
+    def test_sigterm_handler_is_installed_and_shuts_the_server_down(self):
+        installed = {}
+        srv = mock.Mock()
+        with mock.patch.object(
+                tokenserver.signal, "signal",
+                side_effect=lambda num, handler: installed.__setitem__(
+                    num, handler)):
+            tokenserver._install_shutdown_signals(srv)
+
+        self.assertIn(tokenserver.signal.SIGTERM, installed)
+        if hasattr(tokenserver.signal, "SIGBREAK"):
+            self.assertIn(tokenserver.signal.SIGBREAK, installed)
+        self.assertNotIn(tokenserver.signal.SIGINT, installed)
+
+        installed[tokenserver.signal.SIGTERM](
+            tokenserver.signal.SIGTERM, None)
+        deadline = time.monotonic() + 2
+        while not srv.shutdown.called and time.monotonic() < deadline:
+            time.sleep(0.01)
+        srv.shutdown.assert_called_once_with()
+
+    def test_handler_runs_shutdown_off_the_signal_thread(self):
+        # srv.shutdown() blocks until serve_forever returns; called ON the
+        # main thread (where signal handlers run, inside serve_forever)
+        # it would deadlock, so it must be dispatched to another thread.
+        installed = {}
+        seen_threads = []
+        srv = mock.Mock()
+        srv.shutdown.side_effect = lambda: seen_threads.append(
+            threading.current_thread())
+        with mock.patch.object(
+                tokenserver.signal, "signal",
+                side_effect=lambda num, handler: installed.__setitem__(
+                    num, handler)):
+            tokenserver._install_shutdown_signals(srv)
+        installed[tokenserver.signal.SIGTERM](
+            tokenserver.signal.SIGTERM, None)
+        deadline = time.monotonic() + 2
+        while not seen_threads and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(seen_threads), 1)
+        self.assertIsNot(seen_threads[0], threading.current_thread())
+
+    def test_a_non_main_thread_cannot_install_but_does_not_crash(self):
+        with mock.patch.object(tokenserver.signal, "signal",
+                               side_effect=ValueError("not main thread")):
+            self.assertFalse(tokenserver._install_shutdown_signals(
+                mock.Mock()))
+
+    def test_main_installs_the_handlers_before_serving(self):
+        source = inspect.getsource(tokenserver.main)
+        self.assertIn("_install_shutdown_signals(srv)", source)
+        self.assertLess(source.index("_install_shutdown_signals(srv)"),
+                        source.index("srv.serve_forever()"))
+
+
+class IdleConnectionTimeoutTests(unittest.TestCase):
+    """A peer that connects and sends nothing must not pin a worker
+    forever; after HTTP_MAX_WORKERS such peers every request got a 503."""
+
+    def test_handler_declares_a_socket_timeout(self):
+        self.assertEqual(tokenserver.Handler.timeout, 15.0)
+
+    def test_idle_connection_releases_its_worker_slot(self):
+        keepalive_seen = []
+
+        class QuickHandler(tokenserver.Handler):
+            def do_GET(inner_self):
+                keepalive_seen.append(inner_self.connection.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_KEEPALIVE))
+                inner_self._send(200, {"ok": True})
+
+        # The class attribute is what StreamRequestHandler.setup applies;
+        # shorten it for the test rather than overriding it in a subclass.
+        with mock.patch.object(tokenserver.Handler, "timeout", 0.2):
+            server = tokenserver.BoundedThreadingHTTPServer(
+                ("127.0.0.1", 0), QuickHandler, max_workers=1)
+            server_thread = threading.Thread(
+                target=server.serve_forever, kwargs={"poll_interval": 0.01},
+                daemon=True)
+            server_thread.start()
+            host, port = server.server_address[:2]
+            idle = socket.create_connection((host, port))
+            try:
+                # Let the idle peer take the only slot, then wait past its
+                # timeout: the slot must come back without the peer doing
+                # anything at all.
+                deadline = time.monotonic() + 2
+                while (server._worker_slots.acquire(blocking=False) and
+                       time.monotonic() < deadline):
+                    server._worker_slots.release()
+                    time.sleep(0.01)
+                with self.assertLogs("tokenserver", level="WARNING") as log:
+                    time.sleep(tokenserver.Handler.timeout + 0.3)
+                    connection = http.client.HTTPConnection(
+                        host, port, timeout=2)
+                    connection.request("GET", "/",
+                                       headers={"Host": "localhost"})
+                    self.assertEqual(connection.getresponse().status, 200)
+                    connection.close()
+                self.assertTrue(any("timed out" in line
+                                    for line in log.output))
+            finally:
+                idle.close()
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=2)
+        self.assertEqual(len(keepalive_seen), 1)
+        self.assertNotEqual(keepalive_seen[0], 0)
+
+
+class JsonNestingBoundTests(unittest.TestCase):
+    """The reader enforces its own nesting bound, so the behaviour is the
+    same on 3.12 (RecursionError) and 3.14 (parses 10 000 levels)."""
+
+    def _handler(self, raw):
+        handler = tokenserver.Handler.__new__(tokenserver.Handler)
+        handler.headers = {"Content-Length": str(len(raw))}
+        handler.rfile = io.BytesIO(raw)
+        handler.connection = JsonBodyReadSafetyTests.StubConnection()
+        handler.json_body_timeout_s = 0.25
+        return handler
+
+    def test_depth_at_the_bound_parses_and_one_past_it_is_rejected(self):
+        limit = tokenserver.JSON_MAX_DEPTH
+        at_limit = b"[" * limit + b"]" * limit
+        past_limit = b"[" * (limit + 1) + b"]" * (limit + 1)
+        self.assertIsInstance(self._handler(at_limit)._read_json_body(),
+                              list)
+        self.assertIsNone(self._handler(past_limit)._read_json_body())
+        self.assertIsNone(self._handler(
+            b'{"a":' * (limit + 1) + b"1" + b"}" * (limit + 1)
+        )._read_json_body())
+
+    def test_brackets_inside_strings_do_not_count(self):
+        raw = json.dumps({"text": "[" * 500 + "{" * 500 + "\\\"[[["}).encode()
+        self.assertEqual(self._handler(raw)._read_json_body()["text"],
+                         "[" * 500 + "{" * 500 + "\\\"[[[")
+
+    def test_bound_is_generous_enough_for_hook_payloads(self):
+        self.assertGreaterEqual(tokenserver.JSON_MAX_DEPTH, 16)
 
 
 if __name__ == "__main__":

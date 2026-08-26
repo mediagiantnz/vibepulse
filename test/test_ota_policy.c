@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stddef.h>
+#include <string.h>
 
 #include "../components/torget_ota/ota_policy.h"
 
@@ -19,6 +20,7 @@ static tg_ota_request valid_request(void) {
   tg_ota_request request = {
       .maintenance_open = true,
       .authorized = true,
+      .running_pending_verify = false,
       .project = "torget",
       .chip = "esp32s3",
       .content_length = TG_OTA_MAX_IMAGE_BYTES,
@@ -54,6 +56,78 @@ static void test_auth_is_checked_before_metadata(void) {
   request.content_length = 0;
   check("unauthorized request leaks no metadata verdicts",
         tg_ota_request_check(&request) == TG_OTA_REJECT_AUTH);
+}
+
+static void test_pending_verify_blocks_the_next_upload(void) {
+  /* A chained OTA into the re-armed window: the running slot is still
+   * PENDING_VERIFY, so IDF would refuse esp_ota_begin. The policy says so
+   * up front, after auth and before any metadata verdict. */
+  tg_ota_request request = valid_request();
+  request.running_pending_verify = true;
+  check("pending-verify running slot rejects an otherwise valid upload",
+        tg_ota_request_check(&request) == TG_OTA_REJECT_PENDING_VERIFY);
+
+  request.project = "other";
+  request.content_length = 0;
+  check("pending verify is answered before project and size",
+        tg_ota_request_check(&request) == TG_OTA_REJECT_PENDING_VERIFY);
+
+  request.authorized = false;
+  check("but never before auth",
+        tg_ota_request_check(&request) == TG_OTA_REJECT_AUTH);
+
+  request.maintenance_open = false;
+  check("and never before the closed window",
+        tg_ota_request_check(&request) == TG_OTA_REJECT_CLOSED);
+}
+
+static void test_constant_time_equal_is_length_checked(void) {
+  const uint8_t a[4] = {1, 2, 3, 4};
+  const uint8_t b[4] = {1, 2, 3, 4};
+  const uint8_t c[4] = {1, 2, 3, 5};
+  check("equal bytes are equal", tg_ota_ct_equal(a, 4, b, 4));
+  check("a last-byte difference is unequal", !tg_ota_ct_equal(a, 4, c, 4));
+  check("a shorter prefix is unequal, not a match",
+        !tg_ota_ct_equal(a, 3, b, 4));
+  check("NULL is never equal to anything", !tg_ota_ct_equal(NULL, 4, b, 4));
+  check("two empty buffers are equal", tg_ota_ct_equal(a, 0, c, 0));
+}
+
+static void test_image_check_needs_digest_and_proof(void) {
+  uint8_t streamed[TG_OTA_DIGEST_BYTES];
+  uint8_t claimed[TG_OTA_DIGEST_BYTES];
+  uint8_t expected[TG_OTA_DIGEST_BYTES];
+  uint8_t presented[TG_OTA_DIGEST_BYTES];
+  memset(streamed, 0xA5, sizeof streamed);
+  memset(claimed, 0xA5, sizeof claimed);
+  memset(expected, 0x3C, sizeof expected);
+  memset(presented, 0x3C, sizeof presented);
+
+  check("matching digest and matching proof accept",
+        tg_ota_image_check(streamed, claimed, expected, presented) ==
+            TG_OTA_IMAGE_ACCEPT);
+
+  /* The proof was made for the claimed digest; a body whose digest differs
+   * is a different image and is discarded even with a valid proof. */
+  streamed[31] ^= 1;
+  check("a streamed digest that differs from the claim is rejected",
+        tg_ota_image_check(streamed, claimed, expected, presented) ==
+            TG_OTA_IMAGE_REJECT_DIGEST);
+  streamed[31] ^= 1;
+
+  /* The right bytes arrived but the sender could not prove the token. */
+  presented[0] ^= 1;
+  check("a proof that does not cover the digest is rejected",
+        tg_ota_image_check(streamed, claimed, expected, presented) ==
+            TG_OTA_IMAGE_REJECT_PROOF);
+
+  /* Ordering: with both wrong, the digest gate is the one reported. The
+   * adapter answers both the same way on the wire; this only fixes which
+   * story the serial log tells. */
+  streamed[0] ^= 1;
+  check("both failing reports the digest gate first",
+        tg_ota_image_check(streamed, claimed, expected, presented) ==
+            TG_OTA_IMAGE_REJECT_DIGEST);
 }
 
 static void test_project_and_chip_pinning(void) {
@@ -141,6 +215,9 @@ static void test_progress_clamps_at_100(void) {
 int main(void) {
   test_closed_window_rejects_everything();
   test_auth_is_checked_before_metadata();
+  test_pending_verify_blocks_the_next_upload();
+  test_constant_time_equal_is_length_checked();
+  test_image_check_needs_digest_and_proof();
   test_project_and_chip_pinning();
   test_size_boundaries();
   test_progress_zero_total();

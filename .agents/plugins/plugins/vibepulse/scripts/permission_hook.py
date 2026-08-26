@@ -80,8 +80,12 @@ def main():
             f"http://127.0.0.1:{port}/api/codex/permission", event,
             read_timeout=_read_timeout())
         if _valid_decision(result):
-            sys.stdout.write(json.dumps(
-                result, ensure_ascii=False, separators=(",", ":")) + "\n")
+            # Bytes, not text: a piped stdout on Windows is cp1252, so a
+            # non-ASCII deny message would reach Codex as invalid UTF-8.
+            sys.stdout.buffer.write((json.dumps(
+                result, ensure_ascii=False, separators=(",", ":")) + "\n"
+            ).encode("utf-8"))
+            sys.stdout.buffer.flush()
     except Exception:
         pass
     return 0

@@ -236,7 +236,7 @@ class StudioApplicationTests(unittest.TestCase):
 
         def fail_header_replace(source, target, *args, **kwargs):
             nonlocal failed
-            if target == self.header_path.name and not failed:
+            if Path(target).name == self.header_path.name and not failed:
                 failed = True
                 raise OSError("simulated header replace failure")
             return real_replace(source, target, *args, **kwargs)
@@ -266,7 +266,7 @@ class StudioApplicationTests(unittest.TestCase):
         def commit_design_then_raise(source, target, *args, **kwargs):
             nonlocal failed
             result = real_replace(source, target, *args, **kwargs)
-            if target == self.design_path.name and not failed:
+            if Path(target).name == self.design_path.name and not failed:
                 failed = True
                 raise OSError("replace committed then reported failure")
             return result
@@ -294,7 +294,7 @@ class StudioApplicationTests(unittest.TestCase):
         def crash_after_design_replace(source, target, *args, **kwargs):
             nonlocal crashed
             result = real_replace(source, target, *args, **kwargs)
-            if target == self.design_path.name and not crashed:
+            if Path(target).name == self.design_path.name and not crashed:
                 crashed = True
                 raise SimulatedProcessCrash()
             return result
@@ -330,7 +330,7 @@ class StudioApplicationTests(unittest.TestCase):
         def crash_after_design_replace(source, target, *args, **kwargs):
             nonlocal crashed
             result = real_replace(source, target, *args, **kwargs)
-            if target == self.design_path.name and not crashed:
+            if Path(target).name == self.design_path.name and not crashed:
                 crashed = True
                 raise SimulatedProcessCrash()
             return result

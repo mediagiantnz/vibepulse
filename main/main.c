@@ -187,11 +187,40 @@ static atomic_bool s_sta_paused;
 static atomic_bool s_trial_ignore_disconnect;
 static _Atomic int s_disconnect_reason;
 
-/* Senaste frånkopplingsorsaken i klartext, för den ärliga nätsidan. */
+/* Senaste frånkopplingsorsaken i klartext, för den ärliga nätsidan.
+ * Skrivs av event-loopen, läses av setupvakten — därför under s_cand_lock,
+ * samma lås som kandidatlistan: en halvskriven orsak på glaset är värre än
+ * ingen. */
 static char s_reason_text[40];
 
 static void cand_lock(void)   { xSemaphoreTake(s_cand_lock, portMAX_DELAY); }
 static void cand_unlock(void) { xSemaphoreGive(s_cand_lock); }
+
+/* Återanslutningspausen. Den var en vTaskDelay(2000) INNE i WiFi-event-
+ * handlern, vilket stoppade hela default-eventloopen i två sekunder per
+ * tapp: alla andra WIFI_/IP_-händelser, SNTP och setupfönstrets pausbegäran
+ * köade bakom den. En engångstimer bär samma paus och samma anslutnings-
+ * försök, men utanför loopen. s_sta_paused läses först när den slår, så
+ * ett setupfönster som tagit radion under tiden vinner fortfarande. */
+#define WIFI_RECONNECT_DELAY_US (2000LL * 1000LL)
+static esp_timer_handle_t s_reconnect_timer;
+
+static void wifi_reconnect_timer_cb(void *arg) {
+  (void)arg;
+  if (!atomic_load(&s_sta_paused)) esp_wifi_connect();
+}
+
+static void wifi_schedule_reconnect(void) {
+  if (!s_reconnect_timer) return;
+  /* Omarmering: en skur av DISCONNECTED ger ETT försök två sekunder efter
+   * den sista, inte ett per händelse. */
+  (void)esp_timer_stop(s_reconnect_timer);
+  esp_err_t err = esp_timer_start_once(s_reconnect_timer,
+                                       WIFI_RECONNECT_DELAY_US);
+  if (err != ESP_OK)
+    ESP_LOGW(TAG, "kunde inte schemalägga återanslutning: %s",
+             esp_err_to_name(err));
+}
 
 /* Bygger om listan ur NVS + secrets.h. prefer != NULL ställer jakten direkt
  * på det nätet (setupfönstret har just fått dess lösenord). */
@@ -247,8 +276,14 @@ static const char *wifi_current_ssid(void) {
   return ssid;
 }
 
+/* Krokens variant: kopian är statisk och BARA för setupvakten, hookens
+ * enda anropare (samma regel som wifi_current_ssid). */
 static const char *wifi_last_reason(void) {
-  return s_reason_text[0] ? s_reason_text : NULL;
+  static char reason[sizeof s_reason_text];
+  cand_lock();
+  memcpy(reason, s_reason_text, sizeof reason);
+  cand_unlock();
+  return reason[0] ? reason : NULL;
 }
 
 static int last_disconnect_reason(void) {
@@ -279,6 +314,7 @@ static void wifi_note_reason(int reason) {
   /* Orsakskoden är diagnosen: 201 = nätet syns inte alls (fel namn, eller
    * bara 5 GHz — S3:an hör enbart 2,4 GHz), 15/204 = fel lösenord. Samma
    * sanning som loggen burit sedan 2026-08-06, nu också på glaset. */
+  cand_lock();
   switch (reason) {
     case 201:
       snprintf(s_reason_text, sizeof s_reason_text, "NOT SEEN - 2.4 GHZ ONLY");
@@ -291,6 +327,7 @@ static void wifi_note_reason(int reason) {
       snprintf(s_reason_text, sizeof s_reason_text, "RADIO REASON %d", reason);
       break;
   }
+  cand_unlock();
 }
 
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
@@ -334,8 +371,8 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         ESP_LOGW(TAG, "kunde inte byta WiFi-konfiguration: %s",
                  esp_err_to_name(err));
     }
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    if (!atomic_load(&s_sta_paused)) esp_wifi_connect();
+    /* Ingen vTaskDelay här: eventloopen får aldrig stå still (se timern). */
+    wifi_schedule_reconnect();
   } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
     /* GOT_IP is enough to say connected even before the first RSSI sample. */
     xEventGroupSetBits(s_net_events, WIFI_GOT_IP);
@@ -344,9 +381,9 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     wifi_copy_current_ssid(ssid, sizeof ssid);
     ESP_LOGI(TAG, "WiFi uppe (\"%s\")", ssid);
     torget_boot_screen_stage(TG_BOOT_WIFI_UP);
-    s_reason_text[0] = '\0';
     atomic_store(&s_disconnect_reason, 0);
     cand_lock();
+    s_reason_text[0] = '\0';
     s_cand_misses = 0;
     cand_unlock();
     /* INGEN NVS här. Att flytta upp nätet i listan läser och skriver en
@@ -452,6 +489,12 @@ static void wifi_start(void) {
 
   wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&init));
+  /* Timern FÖRE handlern: första DISCONNECTED kan komma direkt. */
+  const esp_timer_create_args_t reconnect_args = {
+    .callback = wifi_reconnect_timer_cb,
+    .name = "wifi-reconnect",
+  };
+  ESP_ERROR_CHECK(esp_timer_create(&reconnect_args, &s_reconnect_timer));
   ESP_ERROR_CHECK(esp_event_handler_instance_register(
     WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL, NULL));
   ESP_ERROR_CHECK(esp_event_handler_instance_register(
@@ -545,6 +588,35 @@ static void tick_cb(lv_timer_t *t) {
              (unsigned)render_stats.ring_updates,
              (unsigned)render_stats.unchanged_ticks);
     tk_agent_monitor_render_stats_reset();
+    /* Stackmarginal per apptask: byte som ALDRIG använts sedan boot
+     * (FreeRTOS high-water mark; StackType_t är en byte på Xtensa). De
+     * HTTPS-kapabla taskarna (github 5120, tokens/max-tracker 6144) fick
+     * sina budgetar på känsla — den här raden är mätningen, så nästa
+     * justering kan vara ett tal och inte en gissning. "-" = tasken finns
+     * inte i det här bygget (funktionen av) eller har avslutat sig själv
+     * (torget-net efter boot). Namnuppslaget går tasklistan igenom, en
+     * gång per tio sekunder — billigt nog. */
+    static const char *const probed_tasks[] = {
+      "tokens", "max-tracker", "agent-status", "github", "needs-you-net",
+      "interaction-relay", "wifi-signal", "rotation", "boot-health",
+      "torget-net", "lvgl",
+    };
+    char stacks[200];
+    size_t used = 0;
+    for (size_t i = 0;
+         i < sizeof probed_tasks / sizeof probed_tasks[0] &&
+         used < sizeof stacks; i++) {
+      TaskHandle_t handle = xTaskGetHandle(probed_tasks[i]);
+      int written = handle
+          ? snprintf(stacks + used, sizeof stacks - used, "%s%s=%u",
+                     i ? " " : "", probed_tasks[i],
+                     (unsigned)uxTaskGetStackHighWaterMark(handle))
+          : snprintf(stacks + used, sizeof stacks - used, "%s%s=-",
+                     i ? " " : "", probed_tasks[i]);
+      if (written < 0) break;
+      used += (size_t)written;
+    }
+    ESP_LOGI(TAG, "stack fritt (byte): %s", stacks);
     /* Tidig varning INNAN glaset fryser: panelflushen behöver ett
      * sammanhängande DMA-block på DISPLAY_FLUSH_ROWS×480×2 byte. Faller
      * största DMA-blocket mot det taket dör nästa flush i NO_MEM och hela

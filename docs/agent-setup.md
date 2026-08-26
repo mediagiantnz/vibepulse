@@ -241,6 +241,10 @@ Run the guided setup from the repo root:
 python3 tools/vibepulse_setup.py install
 ```
 
+Windows: `python3` is usually the Microsoft Store alias or absent, so run
+every command in this section as `py -3 tools/vibepulse_setup.py …` (or
+`python …`). The script itself is the same on both platforms.
+
 Choose `off`, `claude`, `codex`, or `both`. Then choose whether bounded
 question/command detail may reach the local panel; the safe default is no.
 This saves the choices for the tokenserver and installs the optional Codex
@@ -383,9 +387,9 @@ workflow, consent model and troubleshooting live in [ota.md](ota.md).
 | Dashes only for Claude, Codex fine (or vice versa) | That provider's source is unavailable | Check `claudeProbe`; the other half working is by design |
 | Never joins WiFi | Network is 5 GHz | 2.4 GHz only. iPhone hotspot: enable "Maximize Compatibility". The glass names the reason itself after 60 s |
 | Moved to a new place; panel finds nothing | The new network was never taught to it | It raises `VibePulse-setup` after 90 s (or a 3 s KEY3 hold). Run `tools/wifi-here.sh` on the Mac, or join the AP from a phone. Remembered afterwards — [docs/wifi.md](wifi.md) |
-| `wifi-here.sh` cannot join the setup AP | The window is closed, or `TG_OTA_TOKEN` is missing so the password is random | Check the glass says WIFI SETUP; without a token run `TG_AP_PASS=<what the glass shows> tools/wifi-here.sh` |
+| `wifi-here.sh` cannot join the setup AP | The window is closed, or it opened by itself (90 s without an IP) or there is no `TG_OTA_TOKEN`, so its password is random | Check the glass says WIFI SETUP; the derived password only works for a window opened with the KEY3 hold. Otherwise run `TG_AP_PASS=<what the glass shows> tools/wifi-here.sh` |
 | Panel joined the venue WiFi but still shows dashes | Client isolation, or a captive portal the panel cannot pass | Not fixable on the device. Use the phone hotspot instead |
-| "This project has no OTA" / partitions.csv shows one factory partition | Reading a tree from before the OTA foundation (A/B slots + otadata + `components/torget_ota/`) | Check which branch/commit the checkout is on; read `partitions.csv` in THAT tree before concluding. OTA workflow: `tools/ota-flash.sh <ip>` + a 3 s KEY3 hold |
+| "This project has no OTA" / partitions.csv shows one factory partition | Reading a tree from before the OTA foundation (A/B slots + otadata + `components/torget_ota/`) | Check which branch/commit the checkout is on; read `partitions.csv` in THAT tree before concluding. OTA workflow: `tools/ota-flash.sh <ip>` + a 3 s KEY3 hold (needs `openssl` on the Mac for the upload proof) |
 | Panel shows stale quota / empty Fable weekly in the morning | Upstream 429 penalty from the shared account bucket | Self-heals: dead tokens are never resent, the penalty persists across restarts, deltas serve from cache. Check `claudeProbe` on `curl localhost:8737/` |
 | Panel shows stale while powered from the computer USB port | The Mac port cannot feed WiFi TX bursts — fetches time out | Expected on Mac USB; run from wall power. Logs stay valid on Mac USB, data does not |
 | OTA boots always show state 0xffffffff and the health gate always rests | `sdkconfig` generated before the rollback line landed in `sdkconfig.defaults` (defaults only apply on fresh generation) | `grep BOOTLOADER_APP_ROLLBACK sdkconfig` — set `=y`, rebuild, and USB-flash ONCE (the bootloader carries the logic; OTA never writes it) |
@@ -393,6 +397,7 @@ workflow, consent model and troubleshooting live in [ota.md](ota.md).
 | Flash starts then dies; board hangs | USB port cannot power the panel | Download mode to flash; own PSU to run |
 | Numbers freeze and go stale | Service or LAN dropped | Last good values are kept deliberately; restart the service |
 | `./test/run.sh` refuses to start | Unpinned PyYAML/Pillow | See [Hardware knowledge](../README.md#hardware-knowledge) |
+| `python3` is not recognised, or opens the Microsoft Store (Windows) | On Windows `python3` is a Store alias, not the interpreter; the real launcher is `py` | Run the same command as `py -3 …` (or `python …`); check `py -3 --version` reports 3.11+ |
 
 ## Simulator only (no board)
 

@@ -24,11 +24,23 @@ file contents, project names, and verdicts never enter this transport.
 ```
 
 The public Worker owns the existing wire contract. It authenticates the secret
-URL, accepts only `/api/tokens`, `/api/max-tracker`, and `/api/github`, validates
-and bounds POST bodies, sanitizes publisher names, and returns the same JSON,
-status codes, and content types the panel already understands. Every accepted
-request selects one deterministic mailbox through the local
-`NUMBERS_MAILBOX` binding.
+URL in constant time (both sides are hashed before a fixed-width compare, so a
+wrong secret costs the same whether its first or last character is wrong),
+accepts only `/api/tokens`, `/api/max-tracker`, and `/api/github`, validates
+and bounds POST bodies, sanitizes publisher names, marks every response
+`Cache-Control: no-store`, and returns the same JSON, status codes, and content
+types the panel already understands. Every accepted request selects one
+deterministic mailbox through the local `NUMBERS_MAILBOX` binding.
+
+A POST body must be a numbers document: a JSON object of at most 64 KiB
+(measured in UTF-8 bytes) whose values are numbers, booleans, `null`, strings
+of at most 160 characters, or containers nested at most four deep (Max Tracker
+is the deepest honest shape: root, provider, day list, day pair). Objects carry
+at most 128 identifier-style keys, lists at most 512 entries, and a document at
+most 4,096 values in total. Anything else is refused with `400 bad shape` before
+it reaches storage, so the mailbox cannot be repurposed as a note pad. Every
+field the tokenserver publisher sends today fits comfortably; the three real
+worst-case documents are fixtures in `tools/relay/fixtures.mjs`.
 
 The SQLite-backed `NumbersMailbox` Durable Object is the coordinator. It owns:
 
@@ -37,9 +49,12 @@ The SQLite-backed `NumbersMailbox` Durable Object is the coordinator. It owns:
 - a singleton monotonic receipt counter used to order whole documents.
 
 Registration, counter increment, and document storage commit in one synchronous
-SQLite transaction. A ninth publisher is rejected without moving any existing
-publisher. GET reads the known document rows directly; one corrupt row is
-skipped without hiding healthy publishers. The active `worker.js` request path
+SQLite transaction. When all eight names are taken and a ninth arrives, the
+same transaction evicts the registered publisher whose newest document is
+oldest (its rows are deleted) and registers the newcomer; the publisher that is
+publishing is never the one evicted, and a publish from an already registered
+name never evicts anybody. GET reads the known document rows directly; one
+corrupt row is skipped without hiding healthy publishers. The active `worker.js` request path
 does not read or write KV and never calls KV list. The existing `VIBEPULSE`
 binding and data are retained only for bootstrap and rollback.
 
@@ -62,6 +77,15 @@ Worker's three-path allowlist.
 
 Access control is a long secret URL, like a private share link. That is a
 reasonable boundary for percentages and public counts, not for work content.
+Because the URL is the credential, the Worker configuration keeps Cloudflare's
+Workers Logs enabled for the app's own metadata-only diagnostics but turns
+platform invocation logs off (`observability.logs.invocation_logs: false`):
+invocation logs would otherwise retain every request URL, secret included, for
+seven days in the Cloudflare dashboard. If you deployed this Worker with the
+earlier configuration (invocation logs on), assume the secret sat in that log
+window and rotate it: set a new `RELAY_SECRET`, update `TK_VIBEPULSE_RELAY_URL`
+in `secrets.h`, rebuild, and restart every publishing tokenserver with the new
+`--publish` URL.
 Remote questions, verdicts, or live activity require the separate explicit
 end-to-end encrypted features described in
 [docs/interaction-relay.md](interaction-relay.md). Enabling this numbers relay
@@ -76,6 +100,34 @@ the publisher that observed that pool most recently. Claude numbers can
 therefore come from an always-on PC while Codex numbers come from the Mac where
 Codex ran. Cached stale values retain their original observation time, so a
 recently published old cache cannot outrank a genuinely newer reading.
+
+Two rules keep that merge honest across machines:
+
+- A publisher's clock is trusted only up to the moment of receipt. The mailbox
+  clamps every top-level `*ObservedAt` to the Worker's wall time when it is
+  ahead of it, so a machine with a fast clock cannot win every pool for as
+  long as it stays ahead. Older stamps are stored exactly as claimed.
+- The whole pool follows its winner. Before the winner's fields are copied,
+  every field of that pool from every document is dropped, so a winner that
+  did not send, say, `claudeWeekStale` never ends up with its own `Pct` beside
+  another machine's stale flag or reset countdown.
+
+### Publisher names and slots
+
+Each publishing machine names itself with its short hostname (the part before
+the first dot of `socket.gethostname()`, or `--publish-name` if given). That
+name travels in the `X-VibePulse-Publisher` header and the Worker stores it
+in the mailbox's `publishers` table beside that machine's latest documents,
+so the hostname of every machine that has published is visible to whoever
+owns the Cloudflare account. It is never returned to the panel. Choose
+`--publish-name` if the hostname says more than you want a mailbox to hold.
+
+The mailbox keeps eight names. Renaming a machine, reinstalling it, or
+pointing a ninth machine at the same secret does not fill the mailbox for
+good: the newcomer takes the slot of the name whose newest document is
+oldest, so a name that stopped publishing months ago is the first to go and
+active machines are never displaced by one another. No dashboard step is
+needed to free a slot; publishing again re-registers a name.
 
 Max Tracker and GitHub retain whole-document semantics. For those endpoints,
 the mailbox-owned receipt counter makes the most recently stored publication

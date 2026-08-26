@@ -35,9 +35,6 @@ tk_needs_you_view tk_needs_you_view_of(
   view.kind = pending->kind;
   view.offer_deny = true;   /* refusing is always safe and reveals nothing */
   view.offer_approve = pending->can_approve;
-  /* Round up: showing "0s left" while the thing is still answerable reads as
-   * broken, and a second of optimism costs nothing here. */
-  view.seconds_left = (pending->expires_in_ms + 999u) / 1000u;
   /* The ring fraction, in per-mille, against the original hold. No original
    * duration (older service) reads as full rather than inventing a time. */
   uint32_t hold_ms = pending->hold_ms ? pending->hold_ms
@@ -50,6 +47,35 @@ tk_needs_you_view tk_needs_you_view_of(
     view.ring_permille = (uint16_t)(((uint64_t)remaining * 1000u) / hold_ms);
   }
   return view;
+}
+
+void tk_needs_you_restrict_offers(tk_needs_you_view *view,
+                                  bool has_channel) {
+  if (!view || has_channel) return;
+  view->offer_approve = false;
+  view->offer_deny = false;
+}
+
+tk_needs_you_outcome tk_needs_you_outcome_of(tk_needs_you_verdict verdict,
+                                             bool queued) {
+  tk_needs_you_outcome outcome = {0};
+  switch (verdict) {
+    case TK_NEEDS_YOU_VERDICT_LEAVE_IT:
+      outcome.dismiss = true;
+      break;
+    case TK_NEEDS_YOU_VERDICT_APPROVE:
+      outcome.dismiss = queued;
+      outcome.payoff = queued;
+      outcome.unsent = !queued;
+      break;
+    case TK_NEEDS_YOU_VERDICT_DENY:
+      outcome.dismiss = queued;
+      outcome.unsent = !queued;
+      break;
+    default:
+      break;
+  }
+  return outcome;
 }
 
 bool tk_needs_you_allows(const tk_pending_interaction *pending,

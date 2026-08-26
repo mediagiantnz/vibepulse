@@ -41,7 +41,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 MARKETPLACE_NAME = "torget"
 TOKEN_SERVER_URL = "http://127.0.0.1:8737/"
 MAX_DIAGNOSTIC_BYTES = 16 * 1024
-MAX_COMMAND_OUTPUT_BYTES = 16 * 1024
+# 16 KiB was too small for a real Codex install: `codex plugin list --json`
+# is ~22 KiB at 38 installed plugins, which silently discarded the output and
+# reported the resources as foreign. Still bounded, just realistically so.
+MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 15
 NETWORK_TIMEOUT_SECONDS = 2
 PIPE_JOIN_TIMEOUT_SECONDS = 1
@@ -522,7 +525,18 @@ def _decode_command_result(
         stderr = bytes(captured["stderr"]).decode("utf-8", errors="strict")
     except UnicodeError:
         return None
-    return _CommandResult(returncode, stdout, stderr)
+    return _CommandResult(
+        returncode, _universal_newlines(stdout), _universal_newlines(stderr))
+
+
+def _universal_newlines(text: str) -> str:
+    """Match subprocess text=True, which the raw-pipe paths bypass.
+
+    Windows children emit CRLF, so every exact-string and fullmatch probe
+    downstream (_python_probe_ok, _codex_probe_ok) would fail against the
+    LF-terminated literals they compare with.
+    """
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _capture_chunk(captured: dict[str, bytearray], label: str,
@@ -1225,8 +1239,25 @@ def _has_symlink_component(path: Path) -> bool:
     return False
 
 
+def _strip_extended_prefix(value: str) -> str:
+    r"""Normalise Windows' \\?\ extended-length spelling of a path.
+
+    Codex reports marketplaceSource.source as \\?\C:\... on Windows, which is
+    the same directory as C:\... but never string-equal to it, so ownership
+    verification could not succeed. Only the spelling changes.
+    """
+    if value.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + value[8:]
+    if value.startswith("\\\\?\\"):
+        return value[4:]
+    return value
+
+
 def _is_exact_existing_directory(value, expected: Path) -> bool:
     if not isinstance(value, str) or not value:
+        return False
+    value = _strip_extended_prefix(value)
+    if not value:
         return False
     try:
         candidate = Path(value)
@@ -1323,7 +1354,12 @@ def _marketplace_state(text: str, repo_root: Path) -> bool | None:
         return None
     item = matches[0]
     source = item.get("marketplaceSource")
-    if (set(item) != {"name", "root", "marketplaceSource"} or
+    # Newer Codex builds omit marketplaceSource for a local marketplace added
+    # by path; `root` is then the only ownership evidence offered. Absent is
+    # accepted, present is still verified strictly.
+    if set(item) == {"name", "root"}:
+        source = None
+    elif (set(item) != {"name", "root", "marketplaceSource"} or
             not isinstance(source, dict) or
             set(source) != {"sourceType", "source"} or
             source.get("sourceType") != "local"):
@@ -1332,7 +1368,9 @@ def _marketplace_state(text: str, repo_root: Path) -> bool | None:
         expected = Path(repo_root).resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
         return None
-    if (not _is_exact_existing_directory(item.get("root"), expected) or
+    if not _is_exact_existing_directory(item.get("root"), expected):
+        return None
+    if (source is not None and
             not _is_exact_existing_directory(source.get("source"), expected)):
         return None
     return True

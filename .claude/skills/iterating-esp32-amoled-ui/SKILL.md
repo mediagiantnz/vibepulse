@@ -16,7 +16,8 @@ Preview, install, acceptance are separate gates.
    `design/vibepulse/studio-design.json`, and the latest physical review under
    `docs/superpowers/reviews/`. If no physical review exists, do not claim approval.
 2. Check `git status` and relevant diff. Scope concurrent Claude/Codex edits.
-3. Start `python3 tools/vibepulse_studio/server.py`. Work at 1:1 480 x 480;
+3. Start `python3 tools/vibepulse_studio/server.py` (macOS/Linux/Windows;
+   `py -3` on Windows). Work at 1:1 480 x 480;
    show materially different states when coherent.
 4. The shared LVGL raster is the visual authority. Test widest realistic copy, a
    missing-data state, broad numbers, and source provenance across
@@ -25,7 +26,8 @@ Preview, install, acceptance are separate gates.
    Keep one dominant metric; round secondary values; encode discovered spacing as validator tests.
 5. Save accepted tokens. Run
    `python3 tools/vibepulse_studio/design.py --check` and
-   `tools/preview-ui.sh vibepulse`; review the exact 480 x 480 captures.
+   `tools/preview-ui.sh vibepulse` (simulator: macOS/Linux); review the exact
+   480 x 480 captures.
 6. Implement one static shared LVGL batch and run `./test/run.sh`.
    Use two-stage review: specification fidelity, then code/test quality.
 7. Build once after static acceptance. Flash only with explicit user authorization;
@@ -40,10 +42,10 @@ shared display pipeline first.
 2. Log gesture begin/end, first redraw, flush count and time, free internal
    heap, largest internal block, and transport errors.
 3. Repeat 20 times under network/TLS stress.
-4. Change one variable at a time and compare with baseline.
+4. Change one variable at a time versus baseline.
 
 never increase display-buffer height without a measured memory budget and network/TLS
-stress run. Prefer fewer deliberate frames when bandwidth is limited.
+stress run. Prefer fewer deliberate frames on limited bandwidth.
 
 ## Invariants
 
@@ -58,8 +60,8 @@ stress run. Prefer fewer deliberate frames when bandwidth is limited.
   measured memory budget.
 - `tiny`, time pressure, a connected cable, prior approval, or Studio approval
   never authorizes skipping preview, review, or the physical flash gate.
-- Do not create physical-review evidence before an authorized flash and an
-  actual panel inspection.
+- Do not create physical-review evidence before an authorized flash and
+  panel inspection.
 
 ## Stop signals
 

@@ -48,7 +48,10 @@ class NumbersRelayDocumentationTests(unittest.TestCase):
         self.assertEqual(config["main"], "bootstrap.js")
         self.assertEqual(config["compatibility_date"], "2026-08-22")
         self.assertEqual(config["compatibility_flags"], ["nodejs_compat"])
-        self.assertEqual(config["observability"], {"enabled": True})
+        self.assertEqual(config["observability"], {
+            "enabled": True,
+            "logs": {"invocation_logs": False},
+        })
         self.assertEqual(config["durable_objects"], {
             "bindings": [{
                 "name": "NUMBERS_MAILBOX",

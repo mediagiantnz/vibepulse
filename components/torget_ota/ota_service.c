@@ -16,6 +16,7 @@
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "mbedtls/md.h"
 #include "mbedtls/sha256.h"
 
 #include "notice_policy.h"
@@ -79,15 +80,9 @@ void torget_ota_service_close_maintenance(void) {
   if (open_until > 1) atomic_store(&s_maintenance_until_us, 1);
 }
 
-/* Konstanttidsjämförelse: varje byte XOR:as och OR:as ihop, så tiden är
- * densamma oavsett var första avvikelsen sitter — svarstiden får inte
- * läcka hur många inledande tecken av token som stämde. */
-static bool constant_time_equal(const char *a, const char *b, size_t n) {
-  unsigned char diff = 0;
-  for (size_t i = 0; i < n; i++)
-    diff |= (unsigned char)a[i] ^ (unsigned char)b[i];
-  return diff == 0;
-}
+/* Every secret comparison goes through the policy's length-checked
+ * constant-time tg_ota_ct_equal: the answer time must never leak how many
+ * leading bytes of a proof or digest matched. */
 
 #ifdef TG_OTA_TOKEN
 /* Teckenuppsättningen valideras EN gång vid start; ett trasigt token ska
@@ -100,10 +95,24 @@ static bool token_charset_valid(void) {
   }
   return true;
 }
+
+/* The upload proof the sender must present: HMAC-SHA256 keyed with the
+ * token's 64 ASCII characters over the claimed digest's 64 lowercase hex
+ * characters (tools/ota-flash.sh computes the same bytes with openssl).
+ * The token itself never crosses the LAN; the proof is bound to one image
+ * and is useless for any other body. */
+static bool proof_expected(const char *sha_hex, uint8_t out[32]) {
+  const mbedtls_md_info_t *sha256 = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (!sha256) return false;
+  return mbedtls_md_hmac(sha256, (const unsigned char *)TG_OTA_TOKEN,
+                         sizeof(TG_OTA_TOKEN) - 1,
+                         (const unsigned char *)sha_hex, 64, out) == 0;
+}
 #endif
 
 /* 64 små hextecken → 32 byte. Ordningen stor bokstav = fel är avsiktlig:
- * kontraktet säger gemener, och ett kontrakt man tänjer på slutar gälla. */
+ * kontraktet säger gemener, och ett kontrakt man tänjer på slutar gälla.
+ * Används för både digest- och proof-headern. */
 static bool parse_sha256_hex(const char *hex, uint8_t out[32]) {
   for (int i = 0; i < 64; i++) {
     char c = hex[i];
@@ -129,19 +138,34 @@ static esp_err_t reject(httpd_req_t *req, const char *status,
   return ESP_FAIL;
 }
 
+/* Is the running slot still waiting for the boot-health gate? IDF refuses
+ * to open the other slot for writing until this image is marked VALID, so
+ * a chained upload into the re-armed window must wait for the gate (about
+ * 15 s after boot). Published on /api/ota/status as pending_verify so the
+ * sender can wait instead of guessing. */
+static bool running_pending_verify(void) {
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  esp_ota_img_states_t state;
+  return running &&
+         esp_ota_get_state_partition(running, &state) == ESP_OK &&
+         state == ESP_OTA_IMG_PENDING_VERIFY;
+}
+
 /* ------------------------------------------------------- GET /api/ota/status */
 
 static esp_err_t status_get_handler(httpd_req_t *req) {
   const esp_app_desc_t *desc = esp_app_get_description();
   const esp_partition_t *running = esp_ota_get_running_partition();
-  char body[224];
+  char body[256];
   /* Bara fakta enheten själv äger — aldrig token. Saknad partitionsetikett
    * blir ett streck, aldrig ett påhitt (ärlighetsinvarianten). */
   snprintf(body, sizeof body,
            "{\"project\":\"torget\",\"chip\":\"esp32s3\","
-           "\"maintenance_open\":%s,\"max_image_bytes\":%u,"
+           "\"maintenance_open\":%s,\"pending_verify\":%s,"
+           "\"max_image_bytes\":%u,"
            "\"running_version\":\"%s\",\"running_partition\":\"%s\"}",
            torget_ota_service_maintenance_open() ? "true" : "false",
+           running_pending_verify() ? "true" : "false",
            (unsigned)TG_OTA_MAX_IMAGE_BYTES, desc->version,
            running ? running->label : "–");
   httpd_resp_set_type(req, "application/json");
@@ -186,18 +210,32 @@ static esp_err_t firmware_post_handler(httpd_req_t *req) {
   if (!atomic_compare_exchange_strong(&s_upload_active, &idle, true))
     return reject(req, "503 Service Unavailable", "upload already running");
 
-  /* Auktorisering FÖRE policyfrågan: saknat, trasigt eller fel token blir
-   * authorized=false, och policyns ordning (CLOSED > AUTH > ...) avgör
-   * vilket avslag som syns utåt. Headern loggas aldrig. */
+  /* Auktorisering FÖRE policyfrågan: the sender proves the token by
+   * presenting X-VibePulse-Auth = hex(HMAC-SHA256(token, claimed SHA hex)).
+   * A missing or malformed digest header, a missing or malformed proof, or
+   * a proof that does not match becomes authorized=false, and the policy
+   * order (CLOSED > AUTH > ...) decides which rejection is visible. Neither
+   * header is ever logged. The claimed digest and both proofs live on until
+   * the stream is complete: the post-stream verdict re-checks them against
+   * the bytes that actually arrived. */
   bool authorized = false;
+  char sha_hex[65];
+  uint8_t expected_sha[32];
+  uint8_t expected_proof[32] = {0};
+  uint8_t presented_proof[32] = {0};
+  bool sha_ok = httpd_req_get_hdr_value_str(req, "X-VibePulse-SHA256",
+                                            sha_hex, sizeof sha_hex) == ESP_OK &&
+                parse_sha256_hex(sha_hex, expected_sha);
 #ifdef TG_OTA_TOKEN
-  char authorization[7 + 64 + 1];
-  if (s_token_usable &&
-      httpd_req_get_hdr_value_str(req, "Authorization", authorization,
-                                  sizeof authorization) == ESP_OK &&
-      strncmp(authorization, "Bearer ", 7) == 0 &&
-      strlen(authorization + 7) == 64) {
-    authorized = constant_time_equal(authorization + 7, TG_OTA_TOKEN, 64);
+  char proof_hex[65];
+  bool proof_ok = httpd_req_get_hdr_value_str(req, "X-VibePulse-Auth",
+                                              proof_hex, sizeof proof_hex) ==
+                      ESP_OK &&
+                  parse_sha256_hex(proof_hex, presented_proof);
+  if (s_token_usable && sha_ok && proof_ok &&
+      proof_expected(sha_hex, expected_proof)) {
+    authorized = tg_ota_ct_equal(expected_proof, sizeof expected_proof,
+                                 presented_proof, sizeof presented_proof);
   }
 #endif
 
@@ -218,6 +256,7 @@ static esp_err_t firmware_post_handler(httpd_req_t *req) {
   tg_ota_request request = {
       .maintenance_open = torget_ota_service_maintenance_open(),
       .authorized = authorized,
+      .running_pending_verify = running_pending_verify(),
       .project = has_project ? project : NULL,
       .chip = has_chip ? chip : NULL,
       .content_length = req->content_len,
@@ -231,7 +270,13 @@ static esp_err_t firmware_post_handler(httpd_req_t *req) {
       return reject(req, "403 Forbidden", "maintenance window closed");
     case TG_OTA_REJECT_AUTH:
       atomic_store(&s_upload_active, false);
-      return reject(req, "401 Unauthorized", "bad or missing token");
+      return reject(req, "401 Unauthorized", "bad or missing proof");
+    case TG_OTA_REJECT_PENDING_VERIFY:
+      /* The chained-update case: the previous image is still in front of
+       * the boot-health gate. 409 so the sender waits instead of reading a
+       * 500 as success (which is exactly what the old script did). */
+      atomic_store(&s_upload_active, false);
+      return reject(req, "409 Conflict", "previous image not yet verified");
     case TG_OTA_REJECT_PROJECT:
       atomic_store(&s_upload_active, false);
       return reject(req, "400 Bad Request", "wrong project");
@@ -243,13 +288,10 @@ static esp_err_t firmware_post_handler(httpd_req_t *req) {
       return reject(req, "413 Payload Too Large", "image size out of bounds");
   }
 
-  /* SHA-headern efter policyn: avslagsordningen ovan är kontrakt, och en
-   * stängd lucka ska svara 403 även på en trasig digest. */
-  char sha_hex[65];
-  uint8_t expected_sha[32];
-  if (httpd_req_get_hdr_value_str(req, "X-VibePulse-SHA256", sha_hex,
-                                  sizeof sha_hex) != ESP_OK ||
-      !parse_sha256_hex(sha_hex, expected_sha)) {
+  /* Unreachable while authorisation requires the digest header (the proof
+   * is computed over it), kept so that no future auth shortcut can stream a
+   * body without a digest to hold it to. */
+  if (!sha_ok) {
     atomic_store(&s_upload_active, false);
     return reject(req, "400 Bad Request", "sha256 header must be 64 hex");
   }
@@ -335,11 +377,26 @@ static esp_err_t firmware_post_handler(httpd_req_t *req) {
   uint8_t actual_sha[32];
   mbedtls_sha256_finish(&sha, actual_sha);
   mbedtls_sha256_free(&sha);
-  if (memcmp(actual_sha, expected_sha, sizeof actual_sha) != 0) {
-    esp_ota_abort(ota);
-    atomic_store(&s_upload_active, false);
-    ESP_LOGE(TAG, "SHA-256 stämmer inte: avbilden förkastad");
-    return reject(req, "400 Bad Request", "sha256 mismatch");
+  /* The verdict on what actually arrived: the streamed digest must be the
+   * claimed one, and the proof must still cover it. Both are compared in
+   * constant time and every rejection answers the same 403 with no detail;
+   * the reason goes to the serial log only. Nothing below this line runs
+   * for a rejected image, so esp_ota_end and the slot switch stay out of
+   * reach. */
+  switch (tg_ota_image_check(actual_sha, expected_sha, expected_proof,
+                             presented_proof)) {
+    case TG_OTA_IMAGE_ACCEPT:
+      break;
+    case TG_OTA_IMAGE_REJECT_DIGEST:
+      esp_ota_abort(ota);
+      atomic_store(&s_upload_active, false);
+      ESP_LOGE(TAG, "SHA-256 stämmer inte: avbilden förkastad");
+      return reject(req, "403 Forbidden", "rejected");
+    case TG_OTA_IMAGE_REJECT_PROOF:
+      esp_ota_abort(ota);
+      atomic_store(&s_upload_active, false);
+      ESP_LOGE(TAG, "uppladdningsbeviset täcker inte avbilden: förkastad");
+      return reject(req, "403 Forbidden", "rejected");
   }
 
   /* esp_ota_end validerar avbildens struktur; först därefter — och aldrig

@@ -53,6 +53,19 @@ extern const lv_font_t plex_text_17;
 _Static_assert(VP_PERCENT_FONT_PX == 164,
                "plex_num_164 must match the Studio percent token");
 
+/* Every tile index that is created must be inside ui.tiles[]. The Value
+ * page is fixed; the GitHub page is optional and must therefore be the last
+ * index, never one that a smaller build leaves out of the array. */
+_Static_assert(VIEW_VALUE < TK_USAGE_SCREEN_VIEWS,
+               "VIEW_VALUE must index a tile in every build");
+#if TK_GITHUB_SCREEN_ENABLED
+_Static_assert(VIEW_GITHUB == TK_USAGE_SCREEN_VIEWS - 1,
+               "VIEW_GITHUB must be the optional last tile");
+#else
+_Static_assert(VIEW_GITHUB >= TK_USAGE_SCREEN_VIEWS,
+               "VIEW_GITHUB must not shadow a fixed tile when disabled");
+#endif
+
 #define HEADER_LINE_Y 63
 #define PAGER_Y 456
 #define STAT_VALUE_Y VP_RESET_Y
@@ -141,6 +154,7 @@ typedef struct {
   lv_obj_t *stars;
   lv_obj_t *forks;
   bool has_data;
+  bool cached; /* the service itself served last-known-good */
 } github_page;
 
 typedef struct {
@@ -170,7 +184,18 @@ static struct {
   int64_t agent_applied_at_us;
   int64_t last_now_us;
   bool has_agent_snapshot;
+  /* The quota feed's staleness, fed by app.c (/api/tokens). It is also the
+   * panel's contact with the tokenserver itself, so every feed that comes
+   * from that same service is at least this stale. */
   bool stale;
+  /* Per-feed last-good clocks (OBS-09): a page goes STALE on its OWN feed
+   * dying, not only when /api/tokens does. */
+  int64_t tracker_ok_us;
+  bool has_tracker;
+  bool tracker_stale;
+  int64_t github_ok_us;
+  bool has_github;
+  bool github_stale;
 } ui;
 
 static lv_obj_t *bare(lv_obj_t *parent) {
@@ -416,24 +441,35 @@ static void create_github_page(void) {
   create_pager(page->tile, VIEW_GITHUB);
 }
 
+/* Provenance is the page's whole honesty claim: WAITING before the first
+ * good payload, CACHED when the service served last-known-good, STALE when
+ * the feed itself (or the panel's contact with the service) has died, LIVE
+ * only when none of that is true. */
+static void refresh_github_provenance(void) {
+  github_page *page = &ui.github;
+  if (!page->tile) return;
+  lv_label_set_text(page->provenance,
+                    !page->has_data ? "WAITING" :
+                    (ui.github_stale || ui.stale) ? "STALE" :
+                    page->cached ? "CACHED" : "LIVE");
+}
+
 static void apply_github_page(const tk_github_status *status) {
   github_page *page = &ui.github;
   lv_label_set_text(page->project, status->project);
-  lv_label_set_text(page->provenance,
-                    !status->has_data ? "WAITING" :
-                    status->stale ? "CACHED" : "LIVE");
+  page->has_data = status->has_data;
+  page->cached = status->stale;
+  refresh_github_provenance();
   if (!status->has_data) {
     lv_obj_set_style_text_font(page->stars, &plex_num_164, 0);
     lv_label_set_text(page->stars, "–");
     lv_label_set_text(page->forks, "–");
-    page->has_data = false;
     return;
   }
   set_star_hero(status->stars);
   char forks[24];
   compact_count(status->forks, forks, sizeof forks);
   lv_label_set_text(page->forks, forks);
-  page->has_data = true;
 }
 #endif
 
@@ -773,7 +809,9 @@ static void refresh_header(quota_page *page, int64_t now_us) {
 }
 
 static void refresh_tracker_header(tracker_page *page, int64_t now_us) {
-  bool stale = ui.stale || page->quota_stale;
+  /* Own feed first (OBS-09), the service's own cached flag, and the quota
+   * feed as the panel's contact with that same tokenserver. */
+  bool stale = ui.tracker_stale || ui.stale || page->quota_stale;
   refresh_live_header(page->halo, page->context, &page->halo_initialized,
                       &page->halo_visible, &page->context_initialized,
                       page->rendered_context, sizeof page->rendered_context,
@@ -1016,10 +1054,12 @@ void usage_screen_create(lv_obj_t *root) {
   create_burn_rate_page();
   create_tracker_page(&ui.trackers[0], VIEW_TRACKER_CLAUDE, false);
   create_tracker_page(&ui.trackers[1], VIEW_TRACKER_CODEX, true);
+  create_value_page();
+  /* The optional tile is created LAST so its index never sits inside the
+   * fixed range (static-asserted above). */
 #if TK_GITHUB_SCREEN_ENABLED
   create_github_page();
 #endif
-  create_value_page();
 #if TK_GITHUB_NOTIFICATIONS_ENABLED
   /* Created before the agent monitor: NEEDS YOU/ERROR/DONE always retain
    * transient priority over a project star. */
@@ -1041,11 +1081,17 @@ void usage_screen_apply_tokens(const tk_tokens *tokens) {
 
 void usage_screen_apply_max_tracker(const tk_max_tracker *t) {
   if (!t) return;
+  ui.tracker_ok_us = ui.last_now_us;
+  ui.has_tracker = true;
+  ui.tracker_stale = false;
   for (int i = 0; i < 2; i++) apply_tracker_page(&ui.trackers[i], t);
 }
 
 void usage_screen_apply_github(const tk_github_status *status) {
   if (!status || !status->enabled) return;
+  ui.github_ok_us = ui.last_now_us;
+  ui.has_github = true;
+  ui.github_stale = false;
 #if TK_GITHUB_SCREEN_ENABLED
   apply_github_page(status);
 #endif
@@ -1094,8 +1140,28 @@ void usage_screen_apply_agent_status_relay(
   tk_agent_monitor_apply_status_relay(snapshot, now_us);
 }
 
+/* Per-feed staleness clocks (OBS-09). Only feeds that have delivered once
+ * can go stale: before the first payload the page already says so itself. */
+static void refresh_feed_staleness(int64_t now_us) {
+  bool tracker_stale = ui.has_tracker &&
+                       now_us - ui.tracker_ok_us > TK_TRACKER_STALE_AFTER_US;
+  if (tracker_stale != ui.tracker_stale) {
+    ui.tracker_stale = tracker_stale;
+    for (int i = 0; i < 2; i++) refresh_tracker_header(&ui.trackers[i], now_us);
+  }
+  bool github_stale = ui.has_github &&
+                      now_us - ui.github_ok_us > TK_FEED_STALE_AFTER_US;
+  if (github_stale != ui.github_stale) {
+    ui.github_stale = github_stale;
+#if TK_GITHUB_SCREEN_ENABLED
+    refresh_github_provenance();
+#endif
+  }
+}
+
 void usage_screen_tick(int64_t now_us) {
   ui.last_now_us = now_us;
+  refresh_feed_staleness(now_us);
   for (int i = 0; i < 3; i++) refresh_header(&ui.quotas[i], now_us);
   for (int i = 0; i < 2; i++) refresh_tracker_header(&ui.trackers[i], now_us);
   tk_agent_monitor_tick(now_us);
@@ -1110,6 +1176,9 @@ void usage_screen_set_stale(bool stale) {
     refresh_header(&ui.quotas[i], ui.last_now_us);
   for (int i = 0; i < 2; i++)
     refresh_tracker_header(&ui.trackers[i], ui.last_now_us);
+#if TK_GITHUB_SCREEN_ENABLED
+  refresh_github_provenance();
+#endif
 }
 
 void usage_screen_show_view(int index) {

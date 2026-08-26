@@ -154,13 +154,19 @@ static void boot_health_task(void *arg) {
       const esp_app_desc_t *desc = esp_app_get_description();
       if (esp_ota_check_rollback_is_possible() != true) {
         /* Ingen giltig granne att falla tillbaka till (ota_1 aldrig
-         * skriven). Att fälla avbilden nu vore att beordra bootloadern
-         * in i en tom slot — obootbart, och enheten kan bara räddas
-         * över USB. En haltande app på glaset slår en död bräda:
-         * godkänn under protest och skrik i loggen. */
-        ESP_LOGE(TAG, "hälsogrinden fällde avbilden (saknade bevis 0x%02x) "
-                      "men ingen giltig granne finns — stannar i drift",
-                 (unsigned)(TG_HEALTH_REQUIRED & ~health.passed));
+         * skriven, typiskt efter en USB-flash). Att fälla avbilden nu
+         * vore att beordra bootloadern in i en tom slot, obootbart, och
+         * enheten kan bara räddas över USB. En haltande app på glaset slår
+         * en död bräda: godkänn UNDER PROTEST och säg varför i loggen
+         * (WARN: enheten är i drift, men i ett läge docs/ota.md ber en att
+         * lämna genom en avsiktlig andra OTA så båda luckorna fylls). */
+        ESP_LOGW(TAG, "hälsogrinden fällde avbilden (saknade bevis 0x%02x, "
+                      "version %s) men godkänner UNDER PROTEST: "
+                      "esp_ota_check_rollback_is_possible() == false, "
+                      "grannluckan saknar giltig avbild (USB-flash?) och en "
+                      "rollback vore obootbar. Kör en avsiktlig andra OTA "
+                      "så båda luckorna fylls (docs/ota.md)",
+                 (unsigned)missing, desc->version);
         esp_ota_mark_app_valid_cancel_rollback();
         break;
       }

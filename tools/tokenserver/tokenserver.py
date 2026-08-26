@@ -43,6 +43,7 @@ import queue
 import re
 import select
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -123,6 +124,18 @@ AUTH_RECOVERY_EVERY_S = 15.0  # lokal tokenkontroll; ingen upstream vid väntan
                       # panelens 30 s-pollar får ändå cachat svar direkt
 HTTP_MAX_WORKERS = 32
 JSON_BODY_TIMEOUT_S = 2.0
+# Deepest JSON nesting a POST body may carry. Enforced by our own byte scan
+# BEFORE json.loads: Python 3.12 raised RecursionError somewhere past a
+# thousand levels, 3.14 parses ten thousand happily, and a hook payload
+# never needs more than a handful, so the bound is ours, not the parser's.
+JSON_MAX_DEPTH = 32
+# A connected peer that never sends a request line pinned a worker thread
+# forever (Handler.timeout was None); HTTP_MAX_WORKERS such peers and every
+# real request got the 503 from _reject_busy. Applied to the socket by
+# StreamRequestHandler.setup, so it bounds every blocking read and write;
+# a parked hook never blocks on the socket while it waits (await_result
+# polls with select + MSG_PEEK), so holding a hook for minutes is unaffected.
+HTTP_IDLE_TIMEOUT_S = 15.0
 
 # Vilka token-källor och systemanrop som finns beror på plattformen, inte på
 # konfiguration. Testerna patchar konstanten för att köra Windows-grenarna
@@ -337,11 +350,102 @@ def _get_quota_cache(path=None):
         return _default_quota_cache
 
 
+def _localize(naive: datetime) -> datetime:
+    """Attach the machine's local zone to a naive local wall-clock time.
+
+    ``astimezone()`` on a naive value asks the OS which offset was in force
+    at THAT instant. That is what makes a boundary computed from a date
+    land on the right side of a DST transition; the one seam the boundary
+    tests patch with a custom zone.
+    """
+    return naive.astimezone()
+
+
+def _local_month_start(now: datetime) -> datetime:
+    """Local midnight on the 1st of ``now``'s month, with the offset that
+    was in force THEN. ``now.replace(day=1, ...)`` kept today's fixed
+    offset and sat an hour off whenever the 1st was on the other side of a
+    DST change."""
+    return _localize(datetime(now.year, now.month, 1))
+
+
+def _local_day_start(now: datetime) -> datetime:
+    """Local midnight of ``now``'s date; same reasoning as the month."""
+    return _localize(datetime(now.year, now.month, now.day))
+
+
+def _tz_offset_minutes(moment: datetime):
+    """The UTC offset of an aware datetime in whole minutes (720 for NZST,
+    780 for NZDT, 120 for CEST), or None for a naive one. Published as
+    ``tzOffsetMin`` so the panel can render reset times in local time."""
+    offset = moment.utcoffset()
+    if offset is None:
+        return None
+    return int(round(offset.total_seconds() / 60))
+
+
 def _quota_identity(provider, scope, raw_identity=None):
     """Return a local opaque identity without retaining its raw input."""
     stable = "default-v1" if raw_identity is None else str(raw_identity)
     material = f"{provider}\0{scope}\0{stable}".encode("utf-8")
     return hashlib.sha256(material).hexdigest()
+
+
+def _usage_record(entry, path: Path, month_start: datetime):
+    """One decoded transcript row -> a records tuple, or None.
+
+    Contract-strict on shape (lessons.md, "Upstream data is hostile"): the
+    row must be a dict with a dict ``message``, a dict ``usage`` and a
+    string ``timestamp``; token counts are coerced like
+    value_meter._count, so a string, bool or list count reads as zero
+    instead of raising. A row this rejects is skipped, never allowed to
+    raise out of _compute, which served a frozen snapshot with
+    usageComputeOk=false until the file aged out of the month.
+    """
+    if not isinstance(entry, dict):
+        return None
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return None
+    usage = message.get("usage")
+    ts_raw = entry.get("timestamp")
+    if not isinstance(usage, dict) or not isinstance(ts_raw, str) or \
+            not ts_raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    ts = ts.astimezone()  # dygnsgränsen är Macens, inte UTC:s
+    if ts < month_start:
+        return None
+    tokens = (
+        value_meter._count(usage.get("input_tokens"))
+        + value_meter._count(usage.get("output_tokens"))
+        + value_meter._count(usage.get("cache_creation_input_tokens"))
+        + value_meter._count(usage.get("cache_read_input_tokens"))
+    )
+    if tokens <= 0:
+        return None
+    msg_id = message.get("id")
+    req_id = entry.get("requestId")
+    key = f"{msg_id}:{req_id}" if msg_id and req_id else None
+    model = message.get("model")
+    usd, unpriced = value_meter.price_usage(
+        model if isinstance(model, str) else None, usage,
+        table=_price_table)
+    session = entry.get("sessionId")
+    if not isinstance(session, str) or not session:
+        session = str(path)
+    return (
+        ts.strftime("%Y-%m-%d"),
+        ts.timestamp(),
+        tokens,
+        session,
+        key,
+        usd,
+        unpriced,
+    )
 
 
 def _parse_file(path: Path, month_start: datetime, start_offset=0):
@@ -366,54 +470,29 @@ def _parse_file(path: Path, month_start: datetime, start_offset=0):
                     entry = json.loads(raw_line)
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue  # halvskriven sista rad — nästa skanning tar den
-                usage = (entry.get("message") or {}).get("usage")
-                ts_raw = entry.get("timestamp")
-                if not usage or not ts_raw:
-                    continue
                 try:
-                    ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-                except ValueError:
-                    continue
-                ts = ts.astimezone()  # dygnsgränsen är Macens, inte UTC:s
-                if ts < month_start:
-                    continue
-                tokens = (
-                    (usage.get("input_tokens") or 0)
-                    + (usage.get("output_tokens") or 0)
-                    + (usage.get("cache_creation_input_tokens") or 0)
-                    + (usage.get("cache_read_input_tokens") or 0)
-                )
-                if tokens <= 0:
-                    continue
-                msg_id = (entry.get("message") or {}).get("id")
-                req_id = entry.get("requestId")
-                key = f"{msg_id}:{req_id}" if msg_id and req_id else None
-                day = ts.strftime("%Y-%m-%d")
-                usd, unpriced = value_meter.price_usage(
-                    (entry.get("message") or {}).get("model"), usage,
-                    table=_price_table)
-                records.append((
-                    day,
-                    ts.timestamp(),
-                    tokens,
-                    entry.get("sessionId") or str(path),
-                    key,
-                    usd,
-                    unpriced,
-                ))
+                    record = _usage_record(entry, path, month_start)
+                except (AttributeError, TypeError, ValueError):
+                    continue  # a shape the guards above did not foresee
+                if record is not None:
+                    records.append(record)
     except OSError:
         pass  # borttagen under läsning — nästa skanning ser det
     return records, parsed_until
 
 
 def _observe_claude_volume(store, records):
+    """Feed records to the store; True when any of them changed its state."""
+    changed = False
     for day, _ts, tokens, _session, _key, _usd, _unpriced in records:
-        store.observe_volume("claude", day, tokens)
+        if store.observe_volume("claude", day, tokens):
+            changed = True
+    return changed
 
 
 def _compute(projects_dir: Path, max_tracker_store=None):
     now = datetime.now().astimezone()
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month_start = _local_month_start(now)
     month_key = month_start.strftime("%Y-%m")
     today = now.strftime("%Y-%m-%d")
     hour_ago = now.timestamp() - 3600
@@ -449,8 +528,8 @@ def _compute(projects_dir: Path, max_tracker_store=None):
             cached["stat"] = stat_key
             cached["offset"] = parsed_until
             if max_tracker_store is not None and new_records:
-                _observe_claude_volume(max_tracker_store, new_records)
-                volume_observed = True
+                if _observe_claude_volume(max_tracker_store, new_records):
+                    volume_observed = True
         else:
             records, parsed_until = _parse_file(
                 path, month_start, start_offset=0)
@@ -462,8 +541,8 @@ def _compute(projects_dir: Path, max_tracker_store=None):
                 "records": records,
             }
             if max_tracker_store is not None and records:
-                _observe_claude_volume(max_tracker_store, records)
-                volume_observed = True
+                if _observe_claude_volume(max_tracker_store, records):
+                    volume_observed = True
     for stale in set(_file_cache) - live_paths:
         del _file_cache[stale]
     if volume_observed:
@@ -705,15 +784,39 @@ def _parse_reset_at(value: str, now_ts: float):
         return None
 
 
+# The only model-scoped weekly pools the panel has a label for. Both Claude
+# parsers map onto this one table, so a new model is added in one place.
+_MODEL_WEEK_LABELS = {
+    "fable": "FABLE · WEEK",
+    "opus": "OPUS · WEEK",
+    "sonnet": "SONNET · WEEK",
+}
+
+
+def _minutes_until(reset_at, now_ts):
+    """Whole minutes from ``now_ts`` to ``reset_at``, floored at zero."""
+    return max(0, int(round((reset_at - now_ts) / 60)))
+
+
+def _stamp_weekly_provenance(found, now_ts):
+    """Add ``<window>ObservedAt``/``<window>Identity`` for every weekly
+    window (general and model) that carries both a percentage and an
+    absolute reset -- the two fields _resolve_weekly_quota needs before it
+    will call an observation live and cache it."""
+    observed_at = int(now_ts)
+    for window, scope in (("week", "general_weekly"),
+                          ("model", "model_weekly")):
+        if f"{window}Pct" in found and f"{window}ResetAt" in found:
+            found[f"{window}ObservedAt"] = observed_at
+            found[f"{window}Identity"] = _quota_identity("claude", scope)
+    return found
+
+
 def _parse_limit_headers(headers, now_ts):
     """Map Claude's named limit windows without guessing model identity."""
     found = {}
     unknown = set()
-    model_labels = {
-        "fable": "FABLE · WEEK",
-        "opus": "OPUS · WEEK",
-        "sonnet": "SONNET · WEEK",
-    }
+    model_labels = _MODEL_WEEK_LABELS
     for name, value in headers.items():
         match = re.match(
             r"(?i)anthropic-ratelimit-unified-(.+?)[-_]"
@@ -748,19 +851,10 @@ def _parse_limit_headers(headers, now_ts):
             reset_at = _parse_reset_at(value, now_ts)
             if reset_at is not None:
                 found[f"{window}ResetAt"] = reset_at
-                found[f"{window}ResetMin"] = max(
-                    0, int(round((reset_at - now_ts) / 60)))
+                found[f"{window}ResetMin"] = _minutes_until(reset_at, now_ts)
     if unknown:
         found["unknownBuckets"] = sorted(unknown)
-    observed_at = int(now_ts)
-    for window, scope in (("week", "general_weekly"),
-                          ("model", "model_weekly")):
-        if (f"{window}Pct" in found and
-                f"{window}ResetAt" in found):
-            found[f"{window}ObservedAt"] = observed_at
-            found[f"{window}Identity"] = _quota_identity(
-                "claude", scope)
-    return found
+    return _stamp_weekly_provenance(found, now_ts)
 
 
 def _parse_usage_limits(body, now_ts):
@@ -768,11 +862,7 @@ def _parse_usage_limits(body, now_ts):
     if not isinstance(body, dict) or not isinstance(body.get("limits"), list):
         return {}
     found = {}
-    model_labels = {
-        "fable": "FABLE · WEEK",
-        "opus": "OPUS · WEEK",
-        "sonnet": "SONNET · WEEK",
-    }
+    model_labels = _MODEL_WEEK_LABELS
     for limit in body["limits"]:
         if not isinstance(limit, dict):
             continue
@@ -809,15 +899,8 @@ def _parse_usage_limits(body, now_ts):
             continue
         found[f"{prefix}Pct"] = round(float(pct), 1)
         found[f"{prefix}ResetAt"] = reset_at
-        found[f"{prefix}ResetMin"] = max(
-            0, int(round((reset_at - now_ts) / 60)))
-        if prefix in {"week", "model"}:
-            scope_name = ("general_weekly" if prefix == "week"
-                          else "model_weekly")
-            found[f"{prefix}ObservedAt"] = int(now_ts)
-            found[f"{prefix}Identity"] = _quota_identity(
-                "claude", scope_name)
-    return found
+        found[f"{prefix}ResetMin"] = _minutes_until(reset_at, now_ts)
+    return _stamp_weekly_provenance(found, now_ts)
 
 
 def _usage_request(token):
@@ -1181,6 +1264,14 @@ CODEX_SESSIONS = Path(os.path.expanduser("~/.codex/sessions"))
 CODEX_LIMITS_EVERY_S = 30
 CODEX_LIMIT_SCAN_BYTES = 1024 * 1024
 CODEX_WEEK_MINUTES = 10080
+# The rollout-log fallback republishes whatever Codex last wrote. The
+# app-server path stamps its reading "now" every CODEX_LIMITS_EVERY_S, so a
+# rollout observation is only comparable while it is about as fresh; past
+# this age it is served with codexWeekStale:true (a future resets_at says
+# nothing about whether the percentage still holds). 15 minutes: long enough
+# to ride out an app-server hiccup, short enough that a Codex session left
+# idle since yesterday cannot masquerade as live all day.
+CODEX_ROLLOUT_FRESH_S = 15 * 60
 _codex_limits_lock = threading.Lock()
 _last_codex_limits = None
 _last_codex_read = 0.0
@@ -1443,51 +1534,16 @@ def _read_codex_app_server_limits(timeout_s=5):
     return {}
 
 
-def _read_latest_rate_limits(path: Path, block_size=64 * 1024,
-                             max_bytes=CODEX_LIMIT_SCAN_BYTES):
-    """Read a rollout backwards and stop at its newest rate-limit event.
-
-    Active Codex rollouts can grow past 100 MB. Reading and splitting the
-    complete file on every display poll is both slow and memory hungry, while
-    the relevant event is normally within the final few kilobytes.
-    """
-    max_bytes = min(max_bytes, CODEX_LIMIT_SCAN_BYTES)
-    try:
-        with path.open("rb") as source:
-            source.seek(0, os.SEEK_END)
-            position = source.tell()
-            fragment = b""
-            remaining = max_bytes
-            while position > 0 and remaining > 0:
-                read_size = min(block_size, position, remaining)
-                position -= read_size
-                remaining -= read_size
-                source.seek(position)
-                parts = (source.read(read_size) + fragment).split(b"\n")
-                fragment = parts.pop(0)
-                for raw_line in reversed(parts):
-                    if b'"rate_limits"' not in raw_line:
-                        continue
-                    try:
-                        found = _codex_rollout_rate_limits(
-                            json.loads(raw_line))
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        continue
-                    if found:
-                        return found
-            if position == 0 and b'"rate_limits"' in fragment:
-                try:
-                    return _codex_rollout_rate_limits(json.loads(fragment))
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    pass
-    except OSError:
-        pass
-    return None
-
-
 def _read_codex_observations(path: Path, now_ts, block_size=64 * 1024,
                              max_bytes=CODEX_LIMIT_SCAN_BYTES):
-    """Return newest general/session observations within a bounded tail."""
+    """Return newest general/session observations within a bounded tail.
+
+    Active Codex rollouts can grow past 100 MB. Reading and splitting the
+    complete file on every display poll is both slow and memory hungry,
+    while the relevant event is normally within the final few kilobytes,
+    so the file is read backwards in ``block_size`` chunks and never past
+    ``max_bytes`` (capped at CODEX_LIMIT_SCAN_BYTES).
+    """
     max_bytes = min(max_bytes, CODEX_LIMIT_SCAN_BYTES)
     general = None
     session = None
@@ -1570,7 +1626,8 @@ def _scan_codex_limits():
             "codexWeekResetAt": weekly["reset_at"],
             "codexWeekObservedAt": weekly["observed_at"],
             "codexWeekIdentity": weekly["identity"],
-            "codexWeekStale": False,
+            "codexWeekStale": bool(
+                now_ts - weekly["observed_at"] > CODEX_ROLLOUT_FRESH_S),
             "codexWeekWindowMinutes": weekly["window_minutes"],
         })
     if session_candidates:
@@ -1771,16 +1828,21 @@ def _resolve_weekly_quota(source, provider, scope, prefix, quota_cache,
     reset_at = source.get(f"{prefix}ResetAt")
     observed_at = source.get(f"{prefix}ObservedAt")
     identity = source.get(f"{prefix}Identity")
-    live = (
+    well_formed = (
         isinstance(pct, (int, float)) and not isinstance(pct, bool) and
         math.isfinite(pct) and 0 <= pct <= 100 and
         isinstance(reset_at, (int, float)) and
         not isinstance(reset_at, bool) and math.isfinite(reset_at) and
         reset_at > now_ts and
         isinstance(observed_at, (int, float)) and
-        not isinstance(observed_at, bool) and math.isfinite(observed_at) and
-        isinstance(identity, str) and bool(identity)
+        not isinstance(observed_at, bool) and math.isfinite(observed_at)
     )
+    # A source that flags itself stale (the rollout fallback past
+    # CODEX_ROLLOUT_FRESH_S) is never live: not cached, not recorded, not
+    # fed to Max Tracker -- but it can still be shown, honestly marked.
+    source_stale = source.get(f"{prefix}Stale") is True
+    live = (well_formed and not source_stale and
+            isinstance(identity, str) and bool(identity))
     if live:
         label = source.get(label_key) if label_key else None
         record = CachedQuota(
@@ -1802,7 +1864,17 @@ def _resolve_weekly_quota(source, provider, scope, prefix, quota_cache,
             "cache_record": record,
         }
     cached = quota_cache.latest(provider, scope, now=now_ts)
-    if cached is not None:
+    fallback = None
+    if source_stale and well_formed:
+        label = source.get(label_key) if label_key else None
+        fallback = {
+            "pct": round(float(pct), 1),
+            "reset_at": int(reset_at),
+            "observed_at": int(observed_at),
+            "label": label if isinstance(label, str) else None,
+        }
+    if cached is not None and (fallback is None or
+                               cached.observed_at >= fallback["observed_at"]):
         return {
             "pct": round(float(cached.pct), 1),
             "reset_at": cached.reset_at,
@@ -1812,6 +1884,8 @@ def _resolve_weekly_quota(source, provider, scope, prefix, quota_cache,
             "live": False,
             "cache_record": None,
         }
+    if fallback is not None:
+        return dict(fallback, stale=True, live=False, cache_record=None)
     return {"pct": None, "reset_at": None, "label": None,
             "stale": False, "live": False, "cache_record": None}
 
@@ -1822,6 +1896,64 @@ def _add_forecast(result, prefix, forecast):
     result[f"{prefix}ForecastPaceFactor"] = forecast.pace_factor
     result[f"{prefix}ForecastAt"] = forecast.exhausts_at
     result[f"{prefix}ForecastOffsetMin"] = forecast.offset_minutes
+
+
+def _max_tracker_payload(projects_dir, max_tracker_store, plans):
+    """The /api/max-tracker body, shared by the LAN route and the relay
+    publisher so the two can never drift apart.
+
+    get_snapshot() is the single place fresh, non-stale/non-cached Claude
+    and Codex percentages get published (see the observe_quota hooks
+    inside it) -- calling it here both feeds today's peaks and gives us
+    the exact "*Stale: false" signal to mirror, so the top-level stale
+    flag below is never an invented second clock.
+    """
+    quota_snapshot = get_snapshot(
+        projects_dir, max_tracker_store=max_tracker_store)
+    today = datetime.now().astimezone().date().isoformat()
+    payload = max_tracker_store.snapshot(today, plans)
+    payload["stale"] = bool(
+        quota_snapshot.get("claudeWeekStale") or
+        quota_snapshot.get("codexWeekStale"))
+    return payload
+
+
+def resolve_quotas(claude, codex, cache, now):
+    """Resolve every quota window /api/tokens publishes, with no side
+    effects: ``claude`` is the probe's reading, ``codex`` the Codex
+    reading, ``cache`` the quota cache (only read here), ``now`` epoch
+    seconds. Returns the Claude session window, the three weekly windows
+    as _resolve_weekly_quota rows and the Codex session reading. Feeding
+    Max Tracker, the usage history, the cache writer and the forecast all
+    stay in get_snapshot(), the one caller, so a reader can see every
+    write in one place.
+    """
+    session_pct = claude.get("sessionPct")
+    session_reset_at = claude.get("sessionResetAt")
+    session_reset_min = _reset_minutes(session_reset_at, now)
+    if session_pct is None or session_reset_min is None:
+        session_pct = None
+        session_reset_at = None
+        session_reset_min = None
+    return {
+        "session": {
+            "pct": session_pct,
+            "reset_at": session_reset_at,
+            "reset_min": session_reset_min,
+        },
+        "week": _resolve_weekly_quota(
+            claude, "claude", "general_weekly", "week", cache, now),
+        "model": _resolve_weekly_quota(
+            claude, "claude", "model_weekly", "model", cache, now,
+            label_key="modelLabel"),
+        "codex_week": _resolve_weekly_quota(
+            codex, "codex", "general_weekly", "codexWeek", cache, now),
+        "codex_session": {
+            "pct": codex.get("codexSessionPct"),
+            "reset_min": codex.get("codexSessionResetMin"),
+            "window_minutes": codex.get("codexSessionWindowMinutes"),
+        },
+    }
 
 
 def _refresh_usage_totals(projects_dir, max_tracker_store=None):
@@ -1889,32 +2021,24 @@ def get_snapshot(projects_dir: Path, history=None, now_ts=None,
     usage_history = _get_usage_history() if history is None else history
     cache = _get_quota_cache() if quota_cache is None else quota_cache
 
-    session_pct = claude.get("sessionPct")
-    session_reset_at = claude.get("sessionResetAt")
-    session_reset_min = _reset_minutes(session_reset_at, current_ts)
-    if session_pct is None or session_reset_min is None:
-        session_pct = None
-        session_reset_at = None
-        session_reset_min = None
+    quotas = resolve_quotas(claude, codex, cache, current_ts)
+    session_pct = quotas["session"]["pct"]
+    session_reset_at = quotas["session"]["reset_at"]
+    claude_week = quotas["week"]
+    claude_model = quotas["model"]
+    codex_week = quotas["codex_week"]
     result["claudeSessionPct"] = session_pct
-    result["claudeSessionResetMin"] = session_reset_min
+    result["claudeSessionResetMin"] = quotas["session"]["reset_min"]
     # Never disk-cached (a Claude session window resets every 5h, so a
     # fallback would be meaningless) -- a non-None reading here is always a
     # genuinely fresh probe result, the honest gate Task 6 requires before
     # anything reaches Max Tracker's day peaks.
     if max_tracker_store is not None and session_pct is not None:
-        max_tracker_store.observe_quota(
-            "claude", MAX_TRACKER_CLAUDE_SESSION_MINUTES, session_pct,
-            current_ts)
-        _mark_max_tracker_dirty(max_tracker_store)
+        if max_tracker_store.observe_quota(
+                "claude", MAX_TRACKER_CLAUDE_SESSION_MINUTES, session_pct,
+                current_ts):
+            _mark_max_tracker_dirty(max_tracker_store)
 
-    claude_week = _resolve_weekly_quota(
-        claude, "claude", "general_weekly", "week", cache, current_ts)
-    claude_model = _resolve_weekly_quota(
-        claude, "claude", "model_weekly", "model", cache, current_ts,
-        label_key="modelLabel")
-    codex_week = _resolve_weekly_quota(
-        codex, "codex", "general_weekly", "codexWeek", cache, current_ts)
     _persist_quota_records_async(cache, (
         claude_week["cache_record"],
         claude_model["cache_record"],
@@ -1930,10 +2054,10 @@ def get_snapshot(projects_dir: Path, history=None, now_ts=None,
     # The exact "*Stale: false" gate: claude_week["live"] is precisely what
     # made claudeWeekStale false above -- never Max Tracker's own clock.
     if max_tracker_store is not None and claude_week["live"]:
-        max_tracker_store.observe_quota(
-            "claude", MAX_TRACKER_CLAUDE_WEEK_MINUTES, claude_week["pct"],
-            claude_week["cache_record"].observed_at)
-        _mark_max_tracker_dirty(max_tracker_store)
+        if max_tracker_store.observe_quota(
+                "claude", MAX_TRACKER_CLAUDE_WEEK_MINUTES, claude_week["pct"],
+                claude_week["cache_record"].observed_at):
+            _mark_max_tracker_dirty(max_tracker_store)
     result["claudeModelWeekPct"] = claude_model["pct"]
     result["claudeModelWeekResetMin"] = _reset_minutes(
         claude_model["reset_at"], current_ts)
@@ -1941,8 +2065,8 @@ def get_snapshot(projects_dir: Path, history=None, now_ts=None,
     result["claudeModelWeekLabel"] = claude_model["label"]
     result["claudeModelWeekStale"] = bool(
         claude_model["pct"] is not None and claude_model["stale"])
-    result["codexSessionPct"] = codex.get("codexSessionPct")
-    result["codexSessionResetMin"] = codex.get("codexSessionResetMin")
+    result["codexSessionPct"] = quotas["codex_session"]["pct"]
+    result["codexSessionResetMin"] = quotas["codex_session"]["reset_min"]
     result["codexWeekPct"] = codex_week["pct"]
     result["codexWeekResetMin"] = _reset_minutes(
         codex_week["reset_at"], current_ts)
@@ -1955,19 +2079,19 @@ def get_snapshot(projects_dir: Path, history=None, now_ts=None,
         # Claude's headers, which only name a window ("5h"/"7d"), so this
         # is the real value rather than an assumed constant.
         codex_session_pct = result["codexSessionPct"]
-        codex_session_window = codex.get("codexSessionWindowMinutes")
+        codex_session_window = quotas["codex_session"]["window_minutes"]
         if (codex_session_pct is not None and
                 _valid_window_minutes(codex_session_window)):
-            max_tracker_store.observe_quota(
-                "codex", codex_session_window, codex_session_pct,
-                current_ts)
-            _mark_max_tracker_dirty(max_tracker_store)
+            if max_tracker_store.observe_quota(
+                    "codex", codex_session_window, codex_session_pct,
+                    current_ts):
+                _mark_max_tracker_dirty(max_tracker_store)
         codex_week_window = codex.get("codexWeekWindowMinutes")
         if codex_week["live"] and _valid_window_minutes(codex_week_window):
-            max_tracker_store.observe_quota(
-                "codex", codex_week_window, codex_week["pct"],
-                codex_week["cache_record"].observed_at)
-            _mark_max_tracker_dirty(max_tracker_store)
+            if max_tracker_store.observe_quota(
+                    "codex", codex_week_window, codex_week["pct"],
+                    codex_week["cache_record"].observed_at):
+                _mark_max_tracker_dirty(max_tracker_store)
 
     claude_session_reset = session_reset_at
     # Reset-tiderna tas från posten oavsett live/cache: en cachad post bär
@@ -1979,25 +2103,38 @@ def get_snapshot(projects_dir: Path, history=None, now_ts=None,
     claude_week_reset = claude_week["reset_at"]
     claude_model_reset = claude_model["reset_at"]
     codex_week_reset = codex_week["reset_at"]
+    # Each sample is filed at the moment it was OBSERVED, not at the
+    # moment this request happened to read it: the Claude probe runs every
+    # LIMITS_EVERY_S and the rollout fallback republishes an event Codex
+    # wrote earlier, so "now" could be minutes late. The 5 h session
+    # window carries no observation time of its own and keeps "now".
     quota_samples = [
-        (provider, window, pct, reset_at)
-        for provider, window, pct, reset_at, is_live in (
+        (provider, window, pct, reset_at, at)
+        for provider, window, pct, reset_at, is_live, at in (
             ("claude", "session", result["claudeSessionPct"],
-             claude_session_reset, True),
+             claude_session_reset, True, current_ts),
             ("claude", "week", result["claudeWeekPct"],
-             claude_week_reset, claude_week["live"]),
+             claude_week_reset, claude_week["live"],
+             claude_week.get("observed_at")),
             ("claude", "model_week", result["claudeModelWeekPct"],
-             claude_model_reset, claude_model["live"]),
+             claude_model_reset, claude_model["live"],
+             claude_model.get("observed_at")),
             ("codex", "week", result["codexWeekPct"],
-             codex_week_reset, codex_week["live"]),
+             codex_week_reset, codex_week["live"],
+             codex_week.get("observed_at")),
         )
         if is_live and pct is not None and reset_at is not None
     ]
-    usage_history.record_many(quota_samples, at=current_ts)
+    samples_by_time = {}
+    for provider, window, pct, reset_at, at in quota_samples:
+        at = current_ts if at is None else at
+        samples_by_time.setdefault(at, []).append(
+            (provider, window, pct, reset_at))
+    for at, samples in samples_by_time.items():
+        usage_history.record_many(samples, at=at)
 
     local_now = datetime.fromtimestamp(current_ts).astimezone()
-    day_start = local_now.replace(
-        hour=0, minute=0, second=0, microsecond=0).timestamp()
+    day_start = _local_day_start(local_now).timestamp()
     result["claudeWeekTodayDeltaPct"] = (
         None if claude_week_reset is None else usage_history.delta_since(
             "claude", "week", day_start, claude_week_reset,
@@ -2025,6 +2162,12 @@ def get_snapshot(projects_dir: Path, history=None, now_ts=None,
                                now=current_ts))
     _add_forecast(result, "claude", claude_forecast)
     _add_forecast(result, "codex", codex_forecast)
+    # The host's current UTC offset, whole minutes (720 NZST, 780 NZDT,
+    # 120 CEST), so the panel renders "RUNS OUT SUN 14:30" in local time
+    # instead of UTC. Omitted, never guessed, when it cannot be determined.
+    tz_offset = _tz_offset_minutes(local_now)
+    if tz_offset is not None:
+        result["tzOffsetMin"] = tz_offset
     # OTA-annonsen rider på kvotpollen: noll ny infrastruktur, och enheten
     # avgör själv (mot sin körande version) om notisen ska visas.
     result["otaAvailableVersion"] = _ota_available_version()
@@ -2099,6 +2242,9 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
+    # StreamRequestHandler.setup() applies this to the accepted socket;
+    # see HTTP_IDLE_TIMEOUT_S for why a None here starved the worker pool.
+    timeout = HTTP_IDLE_TIMEOUT_S
     projects_dir = None  # sätts i main
     agent_status = None  # bakgrundstjänst, sätts i main
     max_tracker_store = None  # sätts i main
@@ -2115,6 +2261,17 @@ class Handler(BaseHTTPRequestHandler):
     agent_status_relay_status = "off"
     agent_status_relay_reason = None
     json_body_timeout_s = JSON_BODY_TIMEOUT_S
+
+    def setup(self):
+        super().setup()
+        # A peer that vanished without a FIN (panel power-cycled, laptop
+        # lid closed mid-hook) is otherwise only noticed when we next
+        # write to it; keepalive lets the kernel notice on its own.
+        try:
+            self.connection.setsockopt(
+                socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except (OSError, AttributeError):
+            pass
 
     def _send(self, code, payload):
         body = json.dumps(payload).encode()
@@ -2202,6 +2359,43 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return supplied_port == expected_port
 
+    _HOST_AUTHORITY_RE = re.compile(
+        r"(?P<host>\[[0-9A-Fa-f:.]+\]|[^\[\]:\s]+)(?::(?P<port>[0-9]{1,5}))?")
+    _MDNS_NAME_RE = re.compile(
+        r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+local")
+
+    def _has_lan_safe_host(self):
+        """Is the Host header one the panel (or an operator's curl) sends?
+
+        A DNS-rebinding page on the LAN resolves ITS OWN hostname to this
+        machine and reads /api/agent-status from a browser; the only thing
+        distinguishing that fetch from the panel's is the Host header, so
+        only an IP literal, a ``.local`` mDNS name or ``localhost`` (each
+        with an optional port) is served. The firmware sends its
+        compiled-in host or IP; nothing legitimate sends a public name.
+        """
+        values = self._header_values("Host")
+        if len(values) != 1 or not isinstance(values[0], str):
+            return False
+        match = self._HOST_AUTHORITY_RE.fullmatch(values[0].strip())
+        if match is None:
+            return False
+        host = match.group("host")
+        if host.startswith("["):
+            try:
+                return ipaddress.ip_address(host[1:-1]).version == 6
+            except ValueError:
+                return False
+        try:
+            ipaddress.ip_address(host)
+            return True
+        except ValueError:
+            pass
+        lowered = host.lower().rstrip(".")
+        if lowered == "localhost":
+            return True
+        return self._MDNS_NAME_RE.fullmatch(lowered) is not None
+
     def _has_json_content_type(self):
         values = self._header_values("Content-Type")
         if len(values) != 1 or not isinstance(values[0], str):
@@ -2209,6 +2403,33 @@ class Handler(BaseHTTPRequestHandler):
         return re.fullmatch(
             r'application/json(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?',
             values[0].strip(), flags=re.IGNORECASE) is not None
+
+    @staticmethod
+    def _json_nesting_exceeds(raw, limit):
+        """True when ``raw`` opens more than ``limit`` nested arrays or
+        objects. A byte scan that skips string contents (escapes included),
+        so brackets inside a string never count; malformed input is left
+        for json.loads to reject."""
+        depth = 0
+        in_string = False
+        escaped = False
+        for byte in raw:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif byte == 0x5C:  # backslash
+                    escaped = True
+                elif byte == 0x22:  # double quote
+                    in_string = False
+            elif byte == 0x22:
+                in_string = True
+            elif byte in (0x5B, 0x7B):  # [ {
+                depth += 1
+                if depth > limit:
+                    return True
+            elif byte in (0x5D, 0x7D):  # ] }
+                depth -= 1
+        return False
 
     def _read_json_body(self, limit=64 * 1024):
         try:
@@ -2234,6 +2455,8 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         if len(raw) != length:
             return None
+        if self._json_nesting_exceeds(raw, JSON_MAX_DEPTH):
+            return None
         try:
             return json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError,
@@ -2241,19 +2464,8 @@ class Handler(BaseHTTPRequestHandler):
             return None
 
     def _max_tracker_payload(self):
-        # get_snapshot() is the single place fresh, non-stale/non-cached
-        # Claude and Codex percentages get published (see the observe_quota
-        # hooks inside it) -- calling it here both feeds today's peaks and
-        # gives us the exact "*Stale: false" signal to mirror, so the top-
-        # level stale flag below is never an invented second clock.
-        quota_snapshot = get_snapshot(
-            self.projects_dir, max_tracker_store=self.max_tracker_store)
-        today = datetime.now().astimezone().date().isoformat()
-        payload = self.max_tracker_store.snapshot(today, self.plans)
-        payload["stale"] = bool(
-            quota_snapshot.get("claudeWeekStale") or
-            quota_snapshot.get("codexWeekStale"))
-        return payload
+        return _max_tracker_payload(
+            self.projects_dir, self.max_tracker_store, self.plans)
 
     def _reply(self, produce):
         """Svara 200 med produce(), annars 500 {"error": ...} — skärmen
@@ -2536,6 +2748,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_GET(self):
+        if not self._has_lan_safe_host():
+            shown = ", ".join(repr(value[:64]) for value in
+                              self._header_values("Host")
+                              if isinstance(value, str)) or "missing"
+            log.warning("GET %s from %s rejected: Host %s is not an IP "
+                        "literal, a .local name or localhost "
+                        "(DNS-rebinding guard)", self.path,
+                        self.address_string(), shown)
+            self._send(421, {"error": "host not allowed"})
+            return
         if self.path == "/api/tokens":
             self._reply(lambda: get_snapshot(
                 self.projects_dir,
@@ -2612,6 +2834,34 @@ class Handler(BaseHTTPRequestHandler):
         # tystade accessloggen tystade felen med sig. Accessloggen ska vara
         # tyst; felen ska inte.
         log.warning("http %s: %s", self.address_string(), fmt % args)
+
+
+def _install_shutdown_signals(srv):
+    """Route SIGTERM (launchctl, Task Scheduler's stop) and, on Windows,
+    SIGBREAK (Ctrl-Break) into ``srv.shutdown()`` so main()'s ``finally``
+    runs: only KeyboardInterrupt used to reach it, and a plain stop skipped
+    the final max-tracker save. ``shutdown()`` blocks until serve_forever
+    returns, and the handler runs ON the thread inside serve_forever, so it
+    is dispatched to a helper thread. Returns False when handlers cannot be
+    installed (not the main thread); the service still runs, it just
+    cannot promise the final flush on a signal.
+    """
+    def request_shutdown(signum, _frame):
+        log.info("signal %d: shutting down", signum)
+        threading.Thread(target=srv.shutdown, name="signal-shutdown",
+                         daemon=True).start()
+
+    names = ["SIGTERM"]
+    if hasattr(signal, "SIGBREAK"):
+        names.append("SIGBREAK")
+    try:
+        for name in names:
+            signal.signal(getattr(signal, name), request_shutdown)
+    except (ValueError, OSError) as exc:
+        log.warning("could not install shutdown signal handlers (%s): a "
+                    "SIGTERM will skip the final max-tracker save", exc)
+        return False
+    return True
 
 
 def _build_arg_parser():
@@ -3177,15 +3427,9 @@ def main():
                                 max_tracker_store=Handler.max_tracker_store)
 
         def _tracker_payload():
-            quota_snapshot = get_snapshot(
-                Handler.projects_dir,
-                max_tracker_store=Handler.max_tracker_store)
-            today = datetime.now().astimezone().date().isoformat()
-            payload = Handler.max_tracker_store.snapshot(today, Handler.plans)
-            payload["stale"] = bool(
-                quota_snapshot.get("claudeWeekStale") or
-                quota_snapshot.get("codexWeekStale"))
-            return payload
+            return _max_tracker_payload(
+                Handler.projects_dir, Handler.max_tracker_store,
+                Handler.plans)
 
         def _github_payload():
             return (github_monitor.snapshot() if github_monitor is not None
@@ -3215,6 +3459,7 @@ def main():
     srv = None
     try:
         srv = BoundedThreadingHTTPServer(("0.0.0.0", args.port), Handler)
+        _install_shutdown_signals(srv)
         log.info("serverar http://0.0.0.0:%d/api/tokens, "
                  "/api/agent-status, /api/max-tracker och /api/github "
                  "(LAN — exponera inte utåt)", args.port)

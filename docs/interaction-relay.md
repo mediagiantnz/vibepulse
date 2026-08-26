@@ -145,7 +145,14 @@ version, nonce, and ciphertext plus bounded routing metadata.
 Encryption does not hide network metadata. Cloudflare can see an IP address
 at each connection, timing and frequency, the mailbox identifier, request ID,
 message direction, HTTP status, and the fixed padded size for that direction.
-The repository's Worker logs only route kind, status, and duration.
+The Worker's own log lines carry only route kind, status, and duration, and
+the committed configuration turns Cloudflare's platform invocation logs off
+(`observability.logs.invocation_logs: false`). Invocation logs would otherwise
+keep every request's URL and headers, including the `Authorization` bearer
+tokens for the Mac and the panel, in the dashboard for seven days. If you
+deployed the Worker before that setting existed, assume both tokens sat in
+that log window: redeploy with the current configuration, then rotate both
+tokens with `relay uninstall --delete-worker` followed by `relay install`.
 
 For live status the Worker sees the same kind of metadata plus one fixed-size
 latest-value status ciphertext. It cannot see project basenames or activity.
@@ -241,10 +248,22 @@ may be exposed, replace the 64-hex key on both computer and panel before
 reinstalling, rebuild the panel, and invalidate the old Worker. Do not reuse a
 numbers-relay secret.
 
-To **Update**, pull a reviewed release, run `npm ci` in
-`tools/interaction-relay`, execute its tests, and rerun relay install after a
-deliberate uninstall/rotation. Never run an unreviewed Worker update against a
-live mailbox.
+To **Update** the Worker code without rotating credentials, pull a reviewed
+release, run `npm ci` and `npm test` in `tools/interaction-relay`, then deploy
+through the guard with the installed mailbox id (the value of
+`TK_VIBEPULSE_INTERACTION_MAILBOX` in your `secrets.h`):
+
+```sh
+cd tools/interaction-relay
+npm run deploy -- --mailbox-id vp_YOUR_INSTALLED_ID
+```
+
+The guard refuses the committed placeholder id and any malformed id, because a
+plain `wrangler deploy` would publish the placeholder over the installed
+mailbox and silently strand both the Mac and the panel. Worker Secrets survive
+a redeploy. To rotate at the same time, use a deliberate uninstall/rotation
+and rerun relay install instead. Never run an unreviewed Worker update against
+a live mailbox.
 
 ## Manual or self-hosted service
 

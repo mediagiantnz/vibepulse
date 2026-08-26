@@ -124,6 +124,15 @@ python3 tokenserver.py
 curl http://localhost:8737/api/tokens
 ```
 
+GET-anropen kräver ett `Host`-huvud som är en IP-adress, ett `.local`-namn
+eller `localhost` (med valfri port); allt annat får `421 Misdirected
+Request` och en varningsrad i loggen. Det är ett skydd mot DNS-rebinding:
+en webbsida på samma nät kan peka sitt eget domännamn på datorn, och det
+enda som skiljer dess anrop från skärmens är just `Host`. Skärmen skickar
+sitt inkompilerade värdnamn eller sin IP, och `curl http://localhost:8737/`
+fungerar som förut; ett publikt namn (till exempel ett Tailscale-namn) gör
+det inte.
+
 ## Valfri GitHub-sida och stjärnhändelser
 
 Ett publikt repo kan övervakas utan token:
@@ -335,6 +344,12 @@ Autostart ingår via Task Scheduler. Kör från repots rot i PowerShell:
 powershell -ExecutionPolicy Bypass -File tools\tokenserver\install-windows-task.ps1
 ```
 
+Tjänsten fångar `SIGTERM` (det `launchctl` och en schemalagd stopp skickar)
+och på Windows `SIGBREAK`, stänger lyssnaren och gör en sista
+max-tracker-flush innan den avslutar. Ett hårt `TerminateProcess`
+(Aktivitetshanterarens "Avsluta") skickar ingen signal alls och hoppar över
+flushen.
+
 Skriptet registrerar tjänsten för den inloggade användaren, startar den
 direkt och startar om den vid fel. Det bakar inte in Claude/Codex- eller
 detaljval i kommandoraden; samma sparade tokenserver-konfiguration används
@@ -374,12 +389,19 @@ null = ärlig frånvaro, skärmen visar streck):
  "codexForecastState": "collecting",
  "codexForecastPctAtReset": null,
  "codexForecastPaceFactor": null,
- "codexForecastAt": null, "codexForecastOffsetMin": null}
+ "codexForecastAt": null, "codexForecastOffsetMin": null,
+ "tzOffsetMin": 720}
 ```
 
 De nya delta- och prognosfälten är frivilliga för äldre skärmkod och `null`
 när underlaget saknas. Prognosen blir först aktiv efter minst tre punkter,
 90 minuters spann och en procents faktisk rörelse i samma resetcykel.
+
+`tzOffsetMin` är datorns aktuella UTC-förskjutning i hela minuter (720 för
+NZST, 780 för NZDT, 120 för CEST, negativt väster om Greenwich) så skärmen
+kan rita resettider i lokal tid i stället för UTC. Fältet utelämnas, aldrig
+gissas, om förskjutningen inte kan bestämmas; en äldre skärm hoppar över
+okända nycklar.
 
 ## Kvotcache och stale-kontrakt
 
@@ -463,6 +485,11 @@ python3 tools/tokenserver/smoke.py
   åtskild från namngivna modellkvoter som Spark. Rollout-loggar används bara
   som fallback; ett passerat `resets_at` eller en fallbackskanning utan
   generell observation räknas som källfel och följer stale-kontraktet ovan.
+  En rollout-observation äldre än 15 minuter (`CODEX_ROLLOUT_FRESH_S`)
+  serveras som `codexWeekStale: true` och skrivs varken till kvotcachen
+  eller usagehistoriken, så en Codex-session som stått orörd sedan igår
+  kan inte se live ut hela dagen. Historikens punkter stämplas med
+  observationens egen tid, inte med tiden för skärmens anrop.
   Claude-proben kostar en tom förfrågan var 240:e sekund — försumbart mot
   fönstren den mäter.
 - Är datorn av visar skärmen streck efter två minuter (stale), inte gamla

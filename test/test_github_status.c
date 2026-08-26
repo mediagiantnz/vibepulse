@@ -105,6 +105,14 @@ int main(void) {
                      "{\"v\":1,\"enabled\":false}[]");
   rejected_unchanged("unknown field",
                      "{\"v\":1,\"enabled\":false,\"future\":1}");
+  /* Hostile depth: CJSON_NESTING_LIMIT is 16 in every build, so a 20-deep
+   * value fails inside cJSON itself, on a bounded stack, before any field
+   * rule runs. */
+  rejected_unchanged("20-deep nesting",
+                     "{\"v\":1,\"enabled\":true,\"repo\":"
+                     "[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]],"
+                     "\"project\":\"b\",\"stars\":1,\"forks\":0,"
+                     "\"stale\":false}");
 
   if (failures) {
     printf("%d GitHub parser tests failed\n", failures);

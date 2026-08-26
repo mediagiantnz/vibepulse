@@ -4,6 +4,11 @@
  * Workers runtime.
  */
 
+function poolKey(key, group, stamp) {
+  return key === stamp ||
+    (key.startsWith(group) && !key.endsWith("ObservedAt"));
+}
+
 export function mergeTokens(docs) {
   const alive = docs.filter((d) => d && typeof d.body === "object" &&
                                    d.body !== null);
@@ -25,10 +30,14 @@ export function mergeTokens(docs) {
       if (winner === null || at > winner.body[stamp]) winner = doc;
     }
     if (winner === null) continue;
+    // The whole pool follows its winner: a loser's Stale flag or ResetMin
+    // must not sit under the winner's Pct just because the winner did not
+    // send that field. Clear every pool key any document carries first.
+    for (const doc of alive)
+      for (const key of Object.keys(doc.body))
+        if (poolKey(key, group, stamp)) delete merged[key];
     for (const key of Object.keys(winner.body))
-      if (key === stamp || (key.startsWith(group) &&
-                            !key.endsWith("ObservedAt")))
-        merged[key] = winner.body[key];
+      if (poolKey(key, group, stamp)) merged[key] = winner.body[key];
   }
   return merged;
 }

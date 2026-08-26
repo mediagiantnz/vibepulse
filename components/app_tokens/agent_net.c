@@ -102,13 +102,18 @@ static void agent_net_task(void *arg) {
   torget_net_wait();
   vTaskDelay(pdMS_TO_TICKS(3000));
 
+  /* No keep_alive_* here on purpose. tk_agent_http_fetch_bounded closes
+   * the connection after every poll (its bounded-read contract needs a
+   * fresh socket per request), so TCP keep-alive settings never had a
+   * connection to act on; they only looked like a policy. Closing per poll
+   * is also the safer choice for the lwIP socket budget: a socket parked
+   * open for the whole uptime would sit alongside the TLS fetches that have
+   * already starved internal RAM once (docs/lessons.md, 2026-08-16), and a
+   * 1 Hz LAN reconnect costs a few hundred bytes for a few milliseconds.
+   * The client object itself IS reused (one esp_http_client_init). */
   esp_http_client_config_t cfg = {
     .url = TK_AGENT_STATUS_URL,
     .timeout_ms = 2500,
-    .keep_alive_enable = true,
-    .keep_alive_idle = 5,
-    .keep_alive_interval = 5,
-    .keep_alive_count = 3,
     .event_handler = status_http_event,
     .user_data = &response,
   };

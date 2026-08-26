@@ -1,8 +1,11 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import worker, { NumbersMailbox } from "./worker.js";
+import worker, { NumbersMailbox, mergeTokens } from "./worker.js";
 import rawConfig from "./wrangler.test.jsonc?raw";
+import {
+  realGithubDocument, realMaxTrackerDocument, realTokensDocument,
+} from "./fixtures.mjs";
 
 const SECRET = "s".repeat(64);
 const MAILBOX_NAME = "numbers-mailbox-v1";
@@ -64,6 +67,20 @@ function fakeEnv({
   return { calls, requestEnv };
 }
 
+// RangeErrors thrown across the RPC boundary surface as unhandled DO-side
+// rejections in the test harness, so invalid publishes are attempted inside
+// the object and reported as a boolean.
+async function publishRejected(stub, endpoint, publisher, bodyJson) {
+  return runInDurableObject(stub, async (instance) => {
+    try {
+      await instance.publish(endpoint, publisher, bodyJson);
+      return false;
+    } catch (error) {
+      return error instanceof RangeError;
+    }
+  });
+}
+
 async function storedState(stub) {
   return runInDurableObject(stub, async (_instance, state) => ({
     publishers: state.storage.sql.exec(
@@ -93,7 +110,7 @@ describe("NumbersMailbox SQLite coordination", () => {
     expect(state.documents).toHaveLength(8);
   });
 
-  it("strictly rejects a ninth publisher without displacing the first eight",
+  it("evicts the longest-silent publisher when a ninth name arrives",
      async () => {
     const stub = mailbox();
     const firstEight = Array.from({ length: 8 }, (_, index) => `p${index}`);
@@ -102,20 +119,146 @@ describe("NumbersMailbox SQLite coordination", () => {
         "/api/tokens", publisher, JSON.stringify({ publisher }),
       )).resolves.toBe("stored");
     }
-
-    await expect(stub.publish(
-      "/api/tokens", "p8", JSON.stringify({ publisher: "p8" }),
-    )).resolves.toBe("full");
+    // p0 was registered first but publishes again, so p1 is now the
+    // publisher whose newest document is oldest.
     await expect(stub.publish(
       "/api/github", "p0", JSON.stringify({ stars: 99 }),
     )).resolves.toBe("stored");
 
+    await expect(stub.publish(
+      "/api/tokens", "p8", JSON.stringify({ publisher: "p8" }),
+    )).resolves.toBe("stored");
+
     const state = await storedState(stub);
-    expect(state.publishers).toEqual(firstEight);
-    expect(state.documents.some((row) => row.publisher === "p8")).toBe(false);
+    expect(state.publishers).toEqual(
+      ["p0", "p2", "p3", "p4", "p5", "p6", "p7", "p8"]);
+    expect(state.documents.some((row) => row.publisher === "p1")).toBe(false);
+    expect(state.documents).toContainEqual(expect.objectContaining({
+      endpoint: "/api/tokens", publisher: "p8",
+    }));
     expect(state.documents).toContainEqual(expect.objectContaining({
       endpoint: "/api/github", publisher: "p0",
     }));
+    await expect(stub.getDocs("/api/tokens")).resolves.toHaveLength(8);
+  });
+
+  it("never evicts the publisher that is publishing and keeps eight names",
+     async () => {
+    const stub = mailbox();
+    for (let index = 0; index < 8; index += 1)
+      await stub.publish("/api/tokens", `p${index}`, JSON.stringify({ index }));
+    // Twelve more distinct names: each arrival evicts exactly one other name
+    // and the arriving name is always present afterwards.
+    for (let index = 8; index < 20; index += 1) {
+      const name = `late${index}`;
+      await expect(stub.publish(
+        "/api/max-tracker", name, JSON.stringify({ index }),
+      )).resolves.toBe("stored");
+      const state = await storedState(stub);
+      expect(state.publishers).toHaveLength(8);
+      expect(state.publishers).toContain(name);
+      expect(state.documents.filter((row) => row.publisher === name))
+        .toHaveLength(1);
+    }
+    // A registered publisher's publish never evicts anybody.
+    const before = (await storedState(stub)).publishers;
+    await stub.publish("/api/github", before[0], JSON.stringify({ stars: 1 }));
+    expect((await storedState(stub)).publishers).toEqual(before);
+  });
+
+  it("evicts a registered name that somehow has no documents first",
+     async () => {
+    const stub = mailbox();
+    for (let index = 0; index < 7; index += 1)
+      await stub.publish("/api/tokens", `p${index}`, JSON.stringify({ index }));
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(
+        "INSERT INTO publishers (publisher) VALUES (?)", "ghost",
+      );
+    });
+    await expect(stub.publish(
+      "/api/tokens", "p7", JSON.stringify({ index: 7 }),
+    )).resolves.toBe("stored");
+    const state = await storedState(stub);
+    expect(state.publishers).not.toContain("ghost");
+    expect(state.publishers).toContain("p0");
+    expect(state.publishers).toContain("p7");
+  });
+
+  it("clamps every claimed *ObservedAt to the receipt wall clock", async () => {
+    const stub = mailbox();
+    const before = Date.now() / 1000;
+    const future = before + 10 * 24 * 3600;
+    await stub.publish("/api/tokens", "fastclock", JSON.stringify({
+      v: 2, claudeWeekPct: 73, claudeWeekObservedAt: future,
+      codexWeekPct: 41, codexWeekObservedAt: future,
+      codexWeekStale: false, nested: { claudeWeekObservedAt: future },
+      claudeWeekObservedAtLabel: "not a stamp",
+    }));
+    const after = Date.now() / 1000;
+    const [doc] = await stub.getDocs("/api/tokens");
+    expect(doc.body.claudeWeekObservedAt).toBeGreaterThanOrEqual(before);
+    expect(doc.body.claudeWeekObservedAt).toBeLessThanOrEqual(after);
+    expect(doc.body.codexWeekObservedAt).toBeGreaterThanOrEqual(before);
+    expect(doc.body.codexWeekObservedAt).toBeLessThanOrEqual(after);
+    // Only top-level stamps are clamped; other fields are stored untouched.
+    expect(doc.body.nested).toEqual({ claudeWeekObservedAt: future });
+    expect(doc.body.claudeWeekObservedAtLabel).toBe("not a stamp");
+    expect(doc.body.claudeWeekPct).toBe(73);
+    expect(doc.body.codexWeekStale).toBe(false);
+  });
+
+  it("keeps an honest older *ObservedAt untouched (republished stale cache)",
+     async () => {
+    const stub = mailbox();
+    const body = { v: 2, claudeWeekPct: 70, claudeWeekStale: true,
+                   claudeWeekObservedAt: 1700000000, codexWeekObservedAt: null };
+    await stub.publish("/api/tokens", "mac", JSON.stringify(body));
+    const state = await storedState(stub);
+    expect(state.documents[0].body_json).toBe(JSON.stringify(body));
+    const [doc] = await stub.getDocs("/api/tokens");
+    expect(doc.body).toEqual(body);
+  });
+
+  it("lets a clamped fast clock lose to a genuinely newer reading", async () => {
+    const stub = mailbox();
+    const now = Date.now() / 1000;
+    await stub.publish("/api/tokens", "fast", JSON.stringify({
+      v: 2, claudeWeekPct: 10, claudeWeekObservedAt: now + 365 * 24 * 3600,
+    }));
+    // The honest publisher observes a little later in wall time than the
+    // clamped receipt, so it must win.
+    await new Promise((resolveWait) => setTimeout(resolveWait, 15));
+    const honestAt = Date.now() / 1000;
+    await stub.publish("/api/tokens", "honest", JSON.stringify({
+      v: 2, claudeWeekPct: 90, claudeWeekObservedAt: honestAt,
+    }));
+    const docs = await stub.getDocs("/api/tokens");
+    const fast = docs.find((doc) => doc.publisher === "fast");
+    expect(fast.body.claudeWeekObservedAt).toBeLessThan(honestAt);
+    const merged = mergeTokens(docs);
+    expect(merged.claudeWeekPct).toBe(90);
+  });
+
+  it("measures the mailbox body limit in UTF-8 bytes", async () => {
+    const stub = mailbox();
+    // 22,000 three-byte characters: 22,000 UTF-16 units but 66,000 bytes.
+    const wide = JSON.stringify({ note: "\u20ac".repeat(22_000) });
+    expect(wide.length).toBeLessThan(64 * 1024);
+    expect(await publishRejected(stub, "/api/tokens", "mac", wide)).toBe(true);
+    expect((await storedState(stub)).documents).toEqual([]);
+  });
+
+  it("refuses documents whose shape no honest publisher sends", async () => {
+    const stub = mailbox();
+    for (const body of [
+      { deep: { a: { b: { c: { d: 1 } } } } }, { prose: "x".repeat(2000) },
+      [1, 2],
+    ])
+      expect(await publishRejected(
+        stub, "/api/tokens", "mac", JSON.stringify(body),
+      )).toBe(true);
+    expect((await storedState(stub)).documents).toEqual([]);
   });
 
   it("commits publisher registration and its endpoint document together",
@@ -264,13 +407,92 @@ describe("public numbers Worker routing and wire contract", () => {
       });
       expect(posted.status).toBe(200);
       expect(await posted.text()).toBe("ok");
+      expect(posted.headers.get("Cache-Control")).toBe("no-store");
 
       const fetched = await relayRequest(env, endpoint);
       expect(fetched.status).toBe(200);
       expect(await fetched.json()).toEqual(body);
       expect(fetched.headers.get("Content-Type")).toBe("application/json");
+      expect(fetched.headers.get("Cache-Control")).toBe("no-store");
     });
   }
+
+  for (const [endpoint, document] of [
+    ["/api/tokens", realTokensDocument()],
+    ["/api/max-tracker", realMaxTrackerDocument()],
+    ["/api/github", realGithubDocument()],
+  ]) {
+    it(`accepts the real worst-case ${endpoint} document end to end`,
+       async () => {
+      const stub = mailbox();
+      const requestEnv = {
+        RELAY_SECRET: SECRET,
+        NUMBERS_MAILBOX: { getByName: () => stub },
+        VIBEPULSE: env.VIBEPULSE,
+      };
+      const posted = await relayRequest(requestEnv, endpoint, {
+        method: "POST", publisher: "real-host", body: document,
+      });
+      expect(posted.status).toBe(200);
+      const fetched = await relayRequest(requestEnv, endpoint);
+      expect(fetched.status).toBe(200);
+      const merged = await fetched.json();
+      // Publisher stamps in the fixture are in the past, so nothing clamps.
+      expect(merged).toEqual(document);
+    });
+  }
+
+  it("marks every response no-store, including errors", async () => {
+    const { requestEnv } = fakeEnv({ publishResult: "full" });
+    const unconfigured = { ...requestEnv, RELAY_SECRET: "short" };
+    const responses = await Promise.all([
+      relayRequest(unconfigured, "/api/tokens"),
+      relayRequest(requestEnv, "/api/tokens", { urlSecret: "x".repeat(64) }),
+      relayRequest(requestEnv, "/api/tokens", { method: "DELETE" }),
+      relayRequest(requestEnv, "/api/tokens", {
+        method: "POST", publisher: "mac", body: "{not-json",
+      }),
+      relayRequest(requestEnv, "/api/tokens", {
+        method: "POST", publisher: "mac", body: "x".repeat(64 * 1024 + 1),
+      }),
+      relayRequest(requestEnv, "/api/tokens", {
+        method: "POST", publisher: "mac", body: { weekPct: 73 },
+      }),
+      relayRequest(fakeEnv().requestEnv, "/api/tokens"),
+    ]);
+    expect(responses.map((response) => response.status))
+      .toEqual([503, 404, 405, 400, 413, 409, 404]);
+    for (const response of responses)
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("rejects oversize bytes, bad UTF-8 and dishonest shapes before the RPC",
+     async () => {
+    const { calls, requestEnv } = fakeEnv();
+    // 22,000 euro signs are under 64 Ki UTF-16 units but over 64 KiB.
+    const wide = await relayRequest(requestEnv, "/api/tokens", {
+      method: "POST", publisher: "mac",
+      body: JSON.stringify({ note: "\u20ac".repeat(22_000) }),
+    });
+    expect(wide.status).toBe(413);
+    const badUtf8 = await worker.fetch(new Request(
+      `https://relay.test/u/${SECRET}/api/tokens`,
+      { method: "POST", body: new Uint8Array([0x7b, 0xff, 0x7d]) },
+    ), requestEnv);
+    expect(badUtf8.status).toBe(400);
+    for (const body of [
+      [1, 2, 3], { prose: "x".repeat(400) },
+      { a: { b: { c: { d: { e: 1 } } } } }, { "bad key!": 1 },
+    ]) {
+      const response = await relayRequest(requestEnv, "/api/tokens", {
+        method: "POST", publisher: "mac", body,
+      });
+      expect(response.status).toBe(400);
+      expect(await response.text()).toBe("bad shape");
+    }
+    expect(calls.publish).toEqual([]);
+    expect(calls.kv).toEqual([]);
+  });
 
   it("routes every valid request to one deterministic mailbox without KV",
      async () => {
@@ -522,6 +744,12 @@ describe("rollback-compatible KV bootstrap", () => {
     expect(fetched.status).toBe(200);
     expect(await fetched.json()).toEqual(body);
     expect(fetched.headers.get("Content-Type")).toBe("application/json");
+    expect(posted.headers.get("Cache-Control")).toBe("no-store");
+    expect(fetched.headers.get("Cache-Control")).toBe("no-store");
+    const wrong = await bootstrap.default.fetch(new Request(
+      `https://relay.test/u/${"x".repeat(64)}/api/github`), env);
+    expect(wrong.status).toBe(404);
+    expect(wrong.headers.get("Cache-Control")).toBe("no-store");
   });
 });
 
@@ -545,5 +773,14 @@ describe("Wrangler Durable Object configuration", () => {
     })]);
     expect(config.secrets).toEqual({ required: ["RELAY_SECRET"] });
     expect(config).not.toHaveProperty("migrations");
+  });
+
+  it("keeps platform invocation logs off because the URL is the credential",
+     () => {
+    const config = JSON.parse(rawConfig);
+    expect(config.observability).toEqual({
+      enabled: true,
+      logs: { invocation_logs: false },
+    });
   });
 });

@@ -406,8 +406,10 @@ replacement, and cause a lost update or displace a valid publisher. **The
 rule:** a dynamic registry with capacity and atomic document storage needs one
 strongly consistent owner, not an index convention. **Guards:** one
 `NumbersMailbox` Durable Object serializes registration, counter, and document
-storage in one SQLite transaction; real-runtime tests race eight publishers and
-strictly reject the ninth. **Watch for:** any shared KV JSON record updated by
+storage in one SQLite transaction; real-runtime tests race eight publishers and,
+since 2026-08-26, evict the quietest registered name in the same transaction
+when a ninth arrives (a permanent hostname-keyed slot table filled up for
+good). **Watch for:** any shared KV JSON record updated by
 multiple writers, even when its maximum size is small.
 
 ## 2026-08-21 · One simulator pixel is not AMOLED-safe spacing
@@ -427,3 +429,29 @@ translated page shell as the header, so burn-in drift cannot make it appear
 pasted above a page or takeover. **Watch for:** approving tiny rounded shapes
 from enlarged simulator previews or testing only bounding boxes and total lit
 pixels.
+
+## 2026-08-26 · time(NULL) <= 0 never fires on an unsynced ESP32
+
+The panel's relay code used `time(NULL) <= 0` as "wall clock not set yet". An
+ESP32 that has not reached SNTP counts seconds since boot, so the value is
+small but positive and the guard never triggered; expiry maths then saturated
+to about 49 days and a replayed-but-authentic relay row could sit on the glass
+for the Worker's full TTL. **The rule:** "unset" on an embedded clock is "below
+a plausible floor", not "zero". **Guards:** `tk_wall_clock_synced()` gates on
+`TK_WALL_CLOCK_SYNC_FLOOR_S`; unsynced panels neither evaluate relay expiry
+nor attach a timestamp to direct LAN verdicts, and the send policy test pins
+the boundary. **Watch for:** any `time(NULL)` comparison against 0 or against
+a build-time constant that is smaller than the SNTP epoch.
+
+## 2026-08-26 · Reason 15 under marginal signal forgot a network that had just worked
+
+`WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT` is emitted for a correct password on a
+weak link as well as for a wrong one. The setup portal treated it as WRONG
+PASSWORD, and because the save branch only ran while the status was still
+CONNECTING, a trial that went on to get an IP was never remembered: the glass
+said WRONG PASSWORD while connected and the network was gone at the next boot.
+**The rule:** an IP on the applied trial is proof of the credentials, whatever
+reason code arrived first. **Guards:** `tg_wifi_join_next_status()` consults the
+reason only while CONNECTING and promotes to CONNECTED on an IP regardless; the
+slots test walks eleven orderings. **Watch for:** any disconnect-reason branch
+that can outrank a later positive signal.

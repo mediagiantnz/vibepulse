@@ -60,15 +60,17 @@ assert re.search(
 required_config = (
     ".url = TK_AGENT_STATUS_URL",
     ".timeout_ms = 2500",
-    ".keep_alive_enable = true",
-    ".keep_alive_idle = 5",
-    ".keep_alive_interval = 5",
-    ".keep_alive_count = 3",
     ".event_handler = status_http_event",
     ".user_data = &response",
 )
 for line in required_config:
     assert line in source, f"missing required client config: {line}"
+# The bounded fetch closes the socket after every poll, so TCP keep-alive
+# fields would be inert configuration that reads like a policy. Keep the
+# client reused, keep the socket per-poll, keep the config honest.
+assert ".keep_alive" not in source, (
+    "keep_alive_* is dead configuration while fetch_bounded closes per poll"
+)
 
 assert source.count("esp_http_client_init(") == 1, (
     "agent polling must create exactly one HTTP client"
@@ -161,8 +163,11 @@ assert re.search(
     needs_you_net,
 ), "Codex must be dropped, never downgraded, when its view binding is absent"
 
+# The callback's word is the honesty gate: bool, true only when queued.
+assert "static bool needs_you_send_cb" in needs_you_net
+assert "return enqueue(&item);" in needs_you_net
 ui_callback = needs_you_net[
-    needs_you_net.index("static void needs_you_send_cb"):
+    needs_you_net.index("static bool needs_you_send_cb"):
     needs_you_net.index("void tk_needs_you_send_panic")
 ]
 for forbidden in ("esp_http", "mbedtls", "tk_ir_encode", "torget_cloud_io"):

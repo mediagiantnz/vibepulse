@@ -332,7 +332,18 @@ def build_payload(state: dict, today: str,
 # durable ``state`` dict described in the module docstring plus the
 # filesystem scans that fill it in.
 
-def _current_month_start_ts() -> float:
+def _localize(naive: datetime) -> datetime:
+    """Attach the machine's local zone to a naive local wall-clock time.
+
+    The one seam the DST tests patch: ``astimezone()`` on a naive value
+    asks the OS which offset was in force at THAT instant, which is what
+    makes a boundary computed from a date (rather than from ``now``) land
+    on the right side of a transition.
+    """
+    return naive.astimezone()
+
+
+def _current_month_start_ts(now: datetime | None = None) -> float:
     """Epoch seconds for the start of the current calendar month, local
     time -- the exact boundary tokenserver.py's own live volume scanner
     (``_compute``) already uses to decide which Claude files it owns
@@ -341,10 +352,16 @@ def _current_month_start_ts() -> float:
     two channels -- the live scanner and the backfill thread -- never
     touch the same file's bytes; see the class docstring's single-writer
     note.
+
+    Built from the naive local date of the 1st, not ``now.replace(day=1)``:
+    ``astimezone()`` hands out a FIXED-offset ``now``, so ``replace`` kept
+    today's offset and the boundary sat an hour off whenever the 1st was
+    on the other side of a DST transition (an hour of a month's first
+    day's records changed owner between the two channels).
     """
-    now = datetime.now().astimezone()
-    return now.replace(day=1, hour=0, minute=0, second=0,
-                       microsecond=0).timestamp()
+    if now is None:
+        now = datetime.now().astimezone()
+    return _localize(datetime(now.year, now.month, 1)).timestamp()
 
 
 def _local_date_str(ts: float) -> str:
@@ -501,8 +518,13 @@ class MaxTrackerStore:
     # -- live rollup ---------------------------------------------------
 
     def observe_quota(self, provider: str, window_minutes: float | None,
-                      pct: float, ts: float) -> None:
+                      pct: float, ts: float) -> bool:
         """Roll one live quota observation into today's peak / this week.
+
+        Returns True only when the durable state actually changed (a new
+        day peak, a week newly marked maxed): the caller marks the 400-day
+        file dirty on that signal alone, so a poll that repeats the same
+        reading costs no prune/serialise/fsync cycle.
 
         ``window_minutes`` classifies the observation exactly like the
         Codex README rule: absent/``None`` or <= 600 minutes is the primary
@@ -519,32 +541,42 @@ class MaxTrackerStore:
         :meth:`observe_volume`.
         """
         if provider not in self._state or not _finite_pct(pct):
-            return
+            return False
         if not isinstance(ts, (int, float)) or isinstance(ts, bool) or not math.isfinite(ts):
-            return
+            return False
         date_str = _local_date_str(ts)
         with self._lock:
             bucket = self._state[provider]
             if window_minutes is None:
-                self._bump_day_pct(bucket, date_str, pct)
-            elif _finite_minutes(window_minutes):
+                return self._bump_day_pct(bucket, date_str, pct)
+            if _finite_minutes(window_minutes):
                 if window_minutes <= self._GENERAL_WINDOW_MINUTES:
-                    self._bump_day_pct(bucket, date_str, pct)
-                elif pct >= 100:
-                    bucket["weeks"][week_key(date_str)] = True
+                    return self._bump_day_pct(bucket, date_str, pct)
+                if pct >= 100:
+                    key = week_key(date_str)
+                    if bucket["weeks"].get(key) is True:
+                        return False
+                    bucket["weeks"][key] = True
+                    return True
             # else: garbage window_minutes -- ignore the observation
             # entirely, never guess which window it meant.
+            return False
 
     @staticmethod
-    def _bump_day_pct(bucket: dict, date_str: str, pct: float) -> None:
+    def _bump_day_pct(bucket: dict, date_str: str, pct: float) -> bool:
         day = bucket["days"].setdefault(date_str, {})
         rounded = _round_day_pct(float(pct))
         current = day.get("pct")
         if current is None or rounded > current:
             day["pct"] = rounded
+            return True
+        return False
 
-    def observe_volume(self, provider: str, date_str: str, tokens: int) -> None:
+    def observe_volume(self, provider: str, date_str: str, tokens: int) -> bool:
         """Add ``tokens`` of raw activity to ``date_str`` and mark it active.
+
+        Returns True when volume was added (every valid call changes the
+        running sum), False for the no-op cases below.
 
         Accumulates (does not overwrite): repeated calls for the same date
         add up, matching how usage log records are naturally summed as they
@@ -560,19 +592,20 @@ class MaxTrackerStore:
         the same time (ambiguous which one wins).
         """
         if provider not in self._state:
-            return
+            return False
         if (not isinstance(tokens, (int, float)) or isinstance(tokens, bool)
                 or not math.isfinite(tokens) or tokens <= 0):
-            return
+            return False
         try:
             date.fromisoformat(date_str)
         except (TypeError, ValueError):
-            return
+            return False
         with self._lock:
             day = self._state[provider]["days"].setdefault(date_str, {})
             day["act"] = True
             day["vol"] = int(day.get("vol") or 0) + int(tokens)
             day.pop("lvl", None)
+        return True
 
     # -- backfill --------------------------------------------------------
 
@@ -650,11 +683,19 @@ class MaxTrackerStore:
         # regardless of where in the list the eventual "chosen" file for
         # this call sits, or whether one was found at all.
         chosen = None
+        present = set()
         for path in paths:
             try:
                 info = path.stat()
+            except FileNotFoundError:
+                continue  # vanished between glob and stat: not present
             except OSError:
+                # Still there, just unreadable right now (permissions, a
+                # transient lock): keep its bookkeeping rather than
+                # re-reading it from 0 once it becomes readable again.
+                present.add(self._inode_of_path(path))
                 continue
+            present.add(info.st_ino)
             if deferred_to_live(info):
                 self._advance_watermark(bucket, pending, info)
                 continue  # this month's own business -- not backfill's
@@ -666,6 +707,14 @@ class MaxTrackerStore:
             if self._is_fully_drained(entry, info):
                 continue  # this inode was already drained at this size
             chosen = (path, info, entry)
+        # Entries are keyed by inode alone, and an inode outlives its
+        # file: on NTFS (and, rarely, APFS) a recycled st_ino would inherit
+        # a stale "done at size N" watermark and silently skip the first N
+        # bytes of a brand-new file. Anything not seen in THIS pass is
+        # gone -- deferred files were stat'd above and stay.
+        for stale in [ino for ino in bucket if ino not in present]:
+            del bucket[stale]
+            pending.pop(stale, None)
         if chosen is None:
             return False
 
@@ -739,6 +788,16 @@ class MaxTrackerStore:
             if not self._is_fully_drained(other_entry, other_info):
                 return True
         return False
+
+    @staticmethod
+    def _inode_of_path(path: Path):
+        """Best-effort inode for a path whose stat just failed with
+        something other than "not found" -- None when nothing works, in
+        which case the entry is simply not protected this pass."""
+        try:
+            return os.stat(path, follow_symlinks=False).st_ino
+        except OSError:
+            return None
 
     @staticmethod
     def _is_fully_drained(entry, info) -> bool:

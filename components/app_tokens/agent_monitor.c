@@ -126,6 +126,7 @@ typedef struct {
   bool offer_deny;
   bool marked;
   bool has_title;
+  bool unsent; /* the last verdict for this item never left the device */
   uint8_t kind;
   uint8_t stage;
   uint8_t options_total;
@@ -142,6 +143,11 @@ static struct {
   bool needs_you_visible; /* read by render_completion to yield the screen */
   ny_stage stage;
   char stage_id[TK_PENDING_ID_CAP]; /* the interaction the stage belongs to */
+  /* The interaction whose APPROVE/DENY the answer channel refused to queue.
+   * While it is the visible one, the takeover stays and says NOT SENT with
+   * LEAVE IT as the only button (the terminal still holds the question). */
+  char unsent_id[TK_PENDING_ID_CAP];
+  bool has_unsent;
   char echo[TK_PENDING_TITLE_CAP];  /* the approved item, for the payoff beat */
   int64_t payoff_until_us;
   tk_agent_provider payoff_provider;
@@ -553,17 +559,51 @@ static ny_physical_fit ny_physical_fit_of(const tk_pending_interaction *p,
   return fit;
 }
 
+/* The decision as the policy allows it AND as this panel can honour it: a
+ * build without an answer channel may only hand the question back. */
+static tk_needs_you_view needs_you_decision(const tk_pending_interaction *p) {
+  tk_needs_you_view decision = tk_needs_you_view_of(&mon.needs_you_state, p);
+  tk_needs_you_restrict_offers(&decision, mon.tk_needs_you_cb != NULL);
+  return decision;
+}
+
+static bool needs_you_is_unsent(const tk_pending_interaction *p) {
+  return mon.has_unsent &&
+         strncmp(mon.unsent_id, p->request_id, TK_PENDING_ID_CAP) == 0;
+}
+
 /* One signed verdict leaving the glass. Every decision is re-checked against
- * the policy here; the render layer never decides. An APPROVE opens the static
- * payoff beat, echoing the verbatim item it just committed. */
+ * the policy here; the render layer never decides. The takeover leaves, and
+ * an APPROVE opens the static payoff beat, ONLY on the channel's word that
+ * the verdict was queued: an answer that stayed on the device keeps the
+ * takeover up and says NOT SENT (docs/lessons.md honesty invariant). */
 static void needs_you_resolve(tk_needs_you_verdict verdict) {
   const tk_pending_interaction *p = &mon.snapshot.pending;
-  tk_needs_you_view decision = tk_needs_you_view_of(&mon.needs_you_state, p);
+  tk_needs_you_view decision = needs_you_decision(p);
   ny_physical_fit fit = ny_physical_fit_of(p, &decision);
   if ((fit.private_fallback && verdict != TK_NEEDS_YOU_VERDICT_LEAVE_IT) ||
       (verdict == TK_NEEDS_YOU_VERDICT_APPROVE && !fit.can_approve)) return;
   if (!tk_needs_you_allows(p, &decision, verdict)) return;
-  if (verdict == TK_NEEDS_YOU_VERDICT_APPROVE) {
+  uint64_t now_ms = mon.rendered_at_us > 0
+                        ? (uint64_t)mon.rendered_at_us / 1000u : 0;
+  tk_ir_decision_context context;
+  bool has_context = tk_ir_policy_capture_visible(
+      &mon.interaction_policy, now_ms, &context);
+  bool queued = false;
+  if (has_context &&
+      strncmp(context.request_id, p->request_id, TK_PENDING_ID_CAP) == 0 &&
+      mon.tk_needs_you_cb) {
+    queued = mon.tk_needs_you_cb(verdict, &context);
+  }
+  tk_needs_you_outcome outcome = tk_needs_you_outcome_of(verdict, queued);
+  if (outcome.unsent) {
+    memcpy(mon.unsent_id, p->request_id, TK_PENDING_ID_CAP);
+    mon.unsent_id[TK_PENDING_ID_CAP - 1] = '\0';
+    mon.has_unsent = true;
+    render_needs_you();
+    return;
+  }
+  if (outcome.payoff) {
     size_t n = 0;
     for (; p->title[n] && n + 1 < sizeof mon.echo; n++) mon.echo[n] = p->title[n];
     mon.echo[n] = '\0';
@@ -571,16 +611,6 @@ static void needs_you_resolve(tk_needs_you_verdict verdict) {
     mon.payoff_until_us = mon.rendered_at_us + 2500LL * 1000LL;
     mon.payoff_provider = p->provider;
     mon.has_payoff_provider = true;
-  }
-  uint64_t now_ms = mon.rendered_at_us > 0
-                        ? (uint64_t)mon.rendered_at_us / 1000u : 0;
-  tk_ir_decision_context context;
-  bool has_context = tk_ir_policy_capture_visible(
-      &mon.interaction_policy, now_ms, &context);
-  if (has_context &&
-      strncmp(context.request_id, p->request_id, TK_PENDING_ID_CAP) == 0 &&
-      mon.tk_needs_you_cb) {
-    mon.tk_needs_you_cb(verdict, &context);
   }
   /* Drop it at the tap, not a poll later, so a second tap can not double-answer. */
   tk_needs_you_mark_answered(&mon.needs_you_state, p);
@@ -611,7 +641,7 @@ static void needs_you_root_event(lv_event_t *event) {
     return;
   }
   const tk_pending_interaction *p = &mon.snapshot.pending;
-  tk_needs_you_view decision = tk_needs_you_view_of(&mon.needs_you_state, p);
+  tk_needs_you_view decision = needs_you_decision(p);
   ny_physical_fit fit = ny_physical_fit_of(p, &decision);
   if (mon.stage == NY_DECISION && fit.private_fallback) {
     needs_you_resolve(TK_NEEDS_YOU_VERDICT_LEAVE_IT);
@@ -940,7 +970,7 @@ static void render_needs_you(void) {
     mon.has_payoff_provider = false;
   }
 
-  tk_needs_you_view decision = tk_needs_you_view_of(&mon.needs_you_state, p);
+  tk_needs_you_view decision = needs_you_decision(p);
   ny_physical_fit fit = ny_physical_fit_of(p, &decision);
   mon.needs_you_visible = decision.visible;
 
@@ -948,21 +978,27 @@ static void render_needs_you(void) {
     ny_show(v->root, false);
     mon.stage = NY_ATTRACT;
     mon.stage_id[0] = '\0';
+    mon.has_unsent = false;
     memset(&mon.needs_you_rendered, 0, sizeof mon.needs_you_rendered);
     mon.rendered_ring_valid = false;
     return;
   }
 
-  /* A fresh interaction always begins at the attract stage. */
+  /* A fresh interaction always begins at the attract stage, with a clean
+   * NOT SENT slate: the refusal belonged to the previous item. */
   if (strncmp(mon.stage_id, p->request_id, TK_PENDING_ID_CAP) != 0) {
     mon.stage = NY_ATTRACT;
     memcpy(mon.stage_id, p->request_id, TK_PENDING_ID_CAP);
     mon.stage_id[TK_PENDING_ID_CAP - 1] = '\0';
+    mon.has_unsent = false;
   }
 
   bool is_question = decision.kind == TK_PENDING_QUESTION;
   bool is_private = fit.private_fallback;
-  bool offer_approve = decision.offer_approve && fit.can_approve;
+  /* An answer the channel refused cannot be retried into the same wedged
+   * queue: only LEAVE IT remains, and the eyebrow says why. */
+  bool unsent = needs_you_is_unsent(p);
+  bool offer_approve = decision.offer_approve && fit.can_approve && !unsent;
   /* DENY is the one restrained-red control: the approval flow only, and only
    * where the service allowed approving — never a blind deny (design law). */
   bool offer_deny = !is_question && offer_approve;
@@ -975,6 +1011,7 @@ static void render_needs_you(void) {
   key.offer_deny = offer_deny;
   key.marked = p->marked;
   key.has_title = p->has_title;
+  key.unsent = unsent;
   key.kind = (uint8_t)decision.kind;
   key.stage = (uint8_t)mon.stage;
   key.options_total = p->options_total;
@@ -1022,12 +1059,17 @@ static void render_needs_you(void) {
   lv_image_set_src(v->h_mascot, is_question ? &tk_img_mascot_asking_4
                                             : &tk_img_mascot_neutral_4);
   char eyebrow[80];
-  if (project[0])
+  if (unsent)
+    snprintf(eyebrow, sizeof eyebrow, "NOT SENT \xC2\xB7 ANSWER AT YOUR DESK");
+  else if (project[0])
     snprintf(eyebrow, sizeof eyebrow, "%s NEEDS YOU \xC2\xB7 %s", provider,
              project);
   else
     snprintf(eyebrow, sizeof eyebrow, "%s NEEDS YOU", provider);
   lv_label_set_text(v->h_eyebrow, eyebrow);
+  /* The refusal is a status, not a provider claim: muted, never the accent
+   * and never the DENY red. */
+  lv_obj_set_style_text_color(v->h_eyebrow, unsent ? COL_MUTED : accent, 0);
   ny_show(v->h_group, true);
 
   if (is_question) {
@@ -1122,7 +1164,7 @@ void tk_agent_monitor_needs_you_tap(void) {
     render_needs_you();
   } else {
     const tk_pending_interaction *p = &mon.snapshot.pending;
-    tk_needs_you_view decision = tk_needs_you_view_of(&mon.needs_you_state, p);
+    tk_needs_you_view decision = needs_you_decision(p);
     ny_physical_fit fit = ny_physical_fit_of(p, &decision);
     if (mon.stage == NY_DECISION && fit.private_fallback) {
       needs_you_resolve(TK_NEEDS_YOU_VERDICT_LEAVE_IT);

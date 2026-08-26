@@ -26,10 +26,10 @@ typedef enum {
 
 typedef struct {
   bool visible;
-  bool offer_approve;   /* only ever true when the service allowed it */
-  bool offer_deny;      /* denying is always safe, so this is always true
-                         * while visible */
-  uint32_t seconds_left;
+  bool offer_approve;   /* only ever true when the service allowed it AND
+                         * the panel has a channel to send it on */
+  bool offer_deny;      /* denying reveals nothing, so it is offered
+                         * whenever visible and the panel can send it */
   /* The countdown ring, as a fraction of the interaction's original hold in
    * per-mille (1000 = full, 0 = about to fall back to the terminal). Computed
    * here, not in the widget, so the ring always maps to the real fallback
@@ -49,6 +49,27 @@ void tk_needs_you_reset(tk_needs_you_state *state);
  * answer, no clock of its own. */
 tk_needs_you_view tk_needs_you_view_of(const tk_needs_you_state *state,
                                        const tk_pending_interaction *pending);
+
+/* A panel with no answer channel (no device key compiled in, or the sender
+ * never started) can only ever LEAVE IT: offering APPROVE or DENY would be
+ * buttons that tell no one. Apply after tk_needs_you_view_of. */
+void tk_needs_you_restrict_offers(tk_needs_you_view *view, bool has_channel);
+
+/* What the glass may do once a verdict has been handed to the answer
+ * channel. queued is the channel's own word: true only when the signed
+ * answer is actually on its way. Honesty rule: the takeover disappears and
+ * the ON IT beat plays ONLY for an answer that left the device; an answer
+ * the channel refused keeps the takeover on the glass and says so. LEAVE IT
+ * is always a local decision (the terminal already holds the interaction),
+ * so it dismisses whether or not anything was sent. */
+typedef struct {
+  bool dismiss; /* mark answered: the takeover leaves at the tap */
+  bool payoff;  /* play the ON IT beat (an APPROVE that really left) */
+  bool unsent;  /* keep the takeover and show NOT SENT */
+} tk_needs_you_outcome;
+
+tk_needs_you_outcome tk_needs_you_outcome_of(tk_needs_you_verdict verdict,
+                                             bool queued);
 
 /* May this verdict be sent for this interaction at all?
  *

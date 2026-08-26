@@ -37,12 +37,17 @@ typedef enum {
   TK_FORECAST_EXHAUSTS,
 } tk_forecast_state;
 
+/* Sanity bound for offset_min: a forecast cannot run out more than a year
+ * before (or after) its reset. The parser rejects anything outside, so the
+ * presenter may negate it without fearing INT_MIN. */
+#define TK_FORECAST_OFFSET_LIMIT_MIN (366 * 24 * 60)
+
 typedef struct {
   tk_forecast_state state;
   int pct_at_reset;
   double pace_factor;
   int64_t at_epoch;
-  int offset_min;
+  int offset_min; /* within +-TK_FORECAST_OFFSET_LIMIT_MIN when has_offset_min */
   int has_pct_at_reset;
   int has_pace_factor;
   int has_at_epoch;
@@ -111,6 +116,13 @@ typedef struct {
   int has_ota_available_version;
   tk_forecast claude_forecast, codex_forecast;
   tk_value value;
+  /* The host's current UTC offset in minutes ("tzOffsetMin", e.g. 720 or
+   * -300), bounded to [-900, 900]. The device has no TZ database of its
+   * own, so this is the only way a clock time on the glass can be local.
+   * Absent or out of range = unknown (has 0): the presenter must then show
+   * a relative time, never a wrong absolute one. */
+  int tz_offset_min;
+  int has_tz_offset_min;
 } tk_tokens;
 
 #endif

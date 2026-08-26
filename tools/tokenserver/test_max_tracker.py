@@ -6,10 +6,11 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from unittest import mock
 
+from tools.tokenserver import max_tracker
 from tools.tokenserver.max_tracker import (
     AGGREGATE_MAX,
     PROVIDERS,
@@ -113,6 +114,45 @@ _BACKFILL_ANCHOR = date.today() - timedelta(days=45)
 
 def _backfill_date(offset_days: int = 0) -> str:
     return (_BACKFILL_ANCHOR + timedelta(days=offset_days)).isoformat()
+
+
+def _local_ts(day: str, hour: int) -> str:
+    """An ISO timestamp at ``hour`` o'clock LOCAL time on ``day``.
+
+    The store buckets every event by the machine's local date (Rule 3),
+    so a fixture that asserts on ``days[day]`` must stamp its rows in
+    local time: ``f"{day}T12:00:00Z"`` is already the next day at UTC+13
+    and the previous day at UTC-11. CI runs in UTC, laptops do not.
+    """
+    return datetime.fromisoformat(day).replace(hour=hour).astimezone(
+        ).isoformat()
+
+
+def _local_day_of(stamp: str) -> str:
+    """The local calendar date the store will file ``stamp`` under."""
+    return datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(
+        ).date().isoformat()
+
+
+class _AutumnZone(tzinfo):
+    """An NZ-shaped zone with a DST transition INSIDE April 2026: +13
+    (summer) until 2026-04-05 03:00 local, +12 afterwards. A custom
+    tzinfo, not the machine's, so the boundary test means the same thing
+    on a UTC CI runner and an NZ laptop."""
+
+    _TRANSITION = datetime(2026, 4, 5, 3, 0)
+
+    def _summer(self, dt):
+        return dt.replace(tzinfo=None) < self._TRANSITION
+
+    def utcoffset(self, dt):
+        return timedelta(hours=13 if self._summer(dt) else 12)
+
+    def dst(self, dt):
+        return timedelta(hours=1 if self._summer(dt) else 0)
+
+    def tzname(self, dt):
+        return "NZDT" if self._summer(dt) else "NZST"
 
 
 def _claude_usage_line(message_id, tokens, timestamp):
@@ -318,7 +358,7 @@ class MaxTrackerStoreBackfillBudgetTests(unittest.TestCase):
             day = _backfill_date()
             path = claude_root / "session.jsonl"
             _write_jsonl(path, [
-                _claude_usage_line("m1", 100, f"{day}T10:00:00Z")])
+                _claude_usage_line("m1", 100, _local_ts(day, 10))])
             _age_into_last_month(path)
             _drain(store)
             self.assertEqual(store._state["claude"]["days"][day]["vol"], 100)
@@ -326,7 +366,7 @@ class MaxTrackerStoreBackfillBudgetTests(unittest.TestCase):
 
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(_claude_usage_line(
-                    "m2", 50, f"{day}T11:00:00Z")) + "\n")
+                    "m2", 50, _local_ts(day, 11))) + "\n")
             self.assertEqual(path.stat().st_ino, inode_before)
             _age_into_last_month(path)
 
@@ -362,8 +402,8 @@ class MaxTrackerStoreBackfillBudgetTests(unittest.TestCase):
             day2 = _backfill_date(2)
             path = claude_root / "session.jsonl"
             _write_jsonl(path, [
-                _claude_usage_line("m1", 100, f"{day}T10:00:00Z"),
-                _claude_usage_line("m2", 50, f"{day}T11:00:00Z"),
+                _claude_usage_line("m1", 100, _local_ts(day, 10)),
+                _claude_usage_line("m2", 50, _local_ts(day, 11)),
             ])
             _age_into_last_month(path)  # Finding C: else backfill defers it
             _drain(store)
@@ -373,7 +413,7 @@ class MaxTrackerStoreBackfillBudgetTests(unittest.TestCase):
             # Truncated and rewritten in place (same path, same inode,
             # smaller size) -- simulates a rotated/rewritten log.
             _write_jsonl(path, [
-                _claude_usage_line("m3", 77, f"{day2}T10:00:00Z")])
+                _claude_usage_line("m3", 77, _local_ts(day2, 10))])
             self.assertEqual(path.stat().st_ino, inode_before)
             _age_into_last_month(path)  # the rewrite also bumped mtime
 
@@ -394,9 +434,9 @@ class MaxTrackerStoreBackfillBudgetTests(unittest.TestCase):
             self.assertGreater(
                 junk_line_bytes, MaxTrackerStore._MAX_LINE_BYTES)
             _write_jsonl(path, [
-                _claude_usage_line("m1", 100, f"{day}T10:00:00Z"),
+                _claude_usage_line("m1", 100, _local_ts(day, 10)),
                 junk,
-                _claude_usage_line("m2", 50, f"{day}T11:00:00Z"),
+                _claude_usage_line("m2", 50, _local_ts(day, 11)),
             ])
             _age_into_last_month(path)  # Finding C: else backfill defers it
 
@@ -429,7 +469,7 @@ class MaxTrackerStoreBackfillBudgetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store, _, claude_root = _new_store(directory)
             day = _backfill_date()
-            row = _claude_usage_line("m1", 100, f"{day}T10:00:00Z")
+            row = _claude_usage_line("m1", 100, _local_ts(day, 10))
             row["padding"] = "x" * (2 * 1024 * 1024)
             row_bytes = len(json.dumps(row).encode("utf-8")) + 1
             self.assertGreater(row_bytes, 2 * 1024 * 1024)
@@ -478,7 +518,7 @@ class MaxTrackerStoreBackfillBudgetTests(unittest.TestCase):
             day = _backfill_date()
             path = claude_root / "session.jsonl"
             _write_jsonl(path, [
-                _claude_usage_line(f"m{i}", 1, f"{day}T10:00:00Z")
+                _claude_usage_line(f"m{i}", 1, _local_ts(day, 10))
                 for i in range(257)
             ])
             _age_into_last_month(path)  # Finding C: else backfill defers it
@@ -495,9 +535,9 @@ class MaxTrackerStoreBackfillBudgetTests(unittest.TestCase):
             day = _backfill_date()
             day2 = _backfill_date(1)
             complete_line = json.dumps(_claude_usage_line(
-                "m1", 100, f"{day}T10:00:00Z"))
+                "m1", 100, _local_ts(day, 10)))
             dangling = json.dumps(_claude_usage_line(
-                "m2", 999, f"{day}T11:00:00Z"))
+                "m2", 999, _local_ts(day, 11)))
             path_a = claude_root / "session-a.jsonl"
             # No trailing newline on the last line -- a writer that
             # crashed or simply hasn't finished this line yet.
@@ -508,7 +548,7 @@ class MaxTrackerStoreBackfillBudgetTests(unittest.TestCase):
             _age_into_last_month(path_a)  # Finding C: else deferred to live
             path_b = claude_root / "session-b.jsonl"
             _write_jsonl(path_b, [_claude_usage_line(
-                "m3", 50, f"{day2}T10:00:00Z")])
+                "m3", 50, _local_ts(day2, 10))])
             _age_into_last_month(path_b)
 
             _drain(store)
@@ -535,9 +575,9 @@ class MaxTrackerStoreBackfillBudgetTests(unittest.TestCase):
             store, _, claude_root = _new_store(directory)
             day = _backfill_date()
             complete_line = json.dumps(_claude_usage_line(
-                "m1", 100, f"{day}T10:00:00Z"))
+                "m1", 100, _local_ts(day, 10)))
             dangling = json.dumps(_claude_usage_line(
-                "m2", 999, f"{day}T11:00:00Z"))
+                "m2", 999, _local_ts(day, 11)))
             path = claude_root / "session.jsonl"
             path.write_text(complete_line + "\n" + dangling)
             _age_into_last_month(path)
@@ -547,7 +587,7 @@ class MaxTrackerStoreBackfillBudgetTests(unittest.TestCase):
 
             # The writer finishes the dangling line and appends another.
             another_line = json.dumps(_claude_usage_line(
-                "m3", 25, f"{day}T12:00:00Z"))
+                "m3", 25, _local_ts(day, 12)))
             with path.open("a", encoding="utf-8") as handle:
                 handle.write("\n" + another_line + "\n")
             _age_into_last_month(path)
@@ -582,7 +622,7 @@ class MaxTrackerStoreLiveWatermarkTests(unittest.TestCase):
             store, _, claude_root = _new_store(directory)
             path = claude_root / "session.jsonl"
             _write_jsonl(path, [
-                _claude_usage_line("m1", 100, "2026-07-15T10:00:00Z")])
+                _claude_usage_line("m1", 100, _local_ts("2026-07-15", 10))])
             file_mtime = path.stat().st_mtime
 
             # Month M: the file's mtime is within the current month, so
@@ -623,7 +663,7 @@ class MaxTrackerStoreLiveWatermarkTests(unittest.TestCase):
             store, _, claude_root = _new_store(directory)
             path = claude_root / "session.jsonl"
             _write_jsonl(path, [
-                _claude_usage_line("m1", 100, "2026-07-15T10:00:00Z")])
+                _claude_usage_line("m1", 100, _local_ts("2026-07-15", 10))])
             file_mtime = path.stat().st_mtime
 
             with mock.patch(
@@ -638,7 +678,7 @@ class MaxTrackerStoreLiveWatermarkTests(unittest.TestCase):
             # append's own real mtime, are what actually matter here).
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(_claude_usage_line(
-                    "m2", 50, "2026-08-01T10:00:00Z")) + "\n")
+                    "m2", 50, _local_ts("2026-08-01", 10))) + "\n")
 
             with mock.patch(
                     "tools.tokenserver.max_tracker._current_month_start_ts",
@@ -662,7 +702,7 @@ class MaxTrackerStoreLiveWatermarkTests(unittest.TestCase):
             store, _, claude_root = _new_store(directory)
             path = claude_root / "session.jsonl"
             _write_jsonl(path, [
-                _claude_usage_line("m1", 300, "2020-01-15T10:00:00Z")])
+                _claude_usage_line("m1", 300, _local_ts("2020-01-15", 10))])
             _age_into_last_month(path)
 
             _drain(store)
@@ -723,14 +763,14 @@ class MaxTrackerStoreEventDateOwnershipTests(unittest.TestCase):
             # cap per call).
             backlog_path = claude_root / "a-backlog.jsonl"
             _write_jsonl(backlog_path, [
-                _claude_usage_line(f"m{i}", 1, "2020-01-01T10:00:00Z")
+                _claude_usage_line(f"m{i}", 1, _local_ts("2020-01-01", 10))
                 for i in range(2000)
             ])
             _age_into_last_month(backlog_path)
 
             live_path = claude_root / "b-live.jsonl"
             _write_jsonl(live_path, [
-                _claude_usage_line("live1", 100, "2020-01-01T10:00:00Z")])
+                _claude_usage_line("live1", 100, _local_ts("2020-01-01", 10))])
             live_mtime = live_path.stat().st_mtime
 
             with mock.patch(
@@ -775,7 +815,7 @@ class MaxTrackerStoreEventDateOwnershipTests(unittest.TestCase):
             # never 200 (100 doubled), never dropped.
             with live_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(_claude_usage_line(
-                    "live2", 50, "2020-01-02T10:00:00Z")) + "\n")
+                    "live2", 50, _local_ts("2020-01-02", 10))) + "\n")
 
             with mock.patch(
                     "tools.tokenserver.max_tracker._current_month_start_ts",
@@ -808,7 +848,7 @@ class MaxTrackerStoreEventDateOwnershipTests(unittest.TestCase):
             # before the real tail is ever reached.
             junk_line = json.dumps({"junk": "x" * (12 * 1024 * 1024)})
             real_tail = json.dumps(_claude_usage_line(
-                "tail", 999, "2020-01-15T10:00:00Z"))
+                "tail", 999, _local_ts("2020-01-15", 10)))
             path.write_text(junk_line + "\n" + real_tail + "\n")
             _age_into_last_month(path)  # dormant -- backfill-owned from the start
             file_mtime = path.stat().st_mtime
@@ -885,10 +925,14 @@ class MaxTrackerStoreEventDateOwnershipTests(unittest.TestCase):
                 for i in range(count):
                     day = old_day(rng.randrange(0, 20))
                     tokens = rng.randrange(1, 50)
+                    # UTC stamps on purpose: the store buckets by LOCAL
+                    # date, so ground truth is keyed by the same local
+                    # date the store will derive (at UTC+13 a 12:00Z
+                    # event belongs to the next calendar day).
+                    stamp = f"{day}T{rng.randrange(0, 23):02d}:00:00Z"
                     lines.append(_claude_usage_line(
-                        f"{path.name}-{i}", tokens,
-                        f"{day}T{rng.randrange(0, 23):02d}:00:00Z"))
-                    record(day, tokens)
+                        f"{path.name}-{i}", tokens, stamp))
+                    record(_local_day_of(stamp), tokens)
                 _write_jsonl(path, lines)
                 os.utime(path, (pre_mtime, pre_mtime))
 
@@ -936,7 +980,7 @@ class MaxTrackerStoreEventDateOwnershipTests(unittest.TestCase):
                 with mid_path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(_claude_usage_line(
                         "mid-drain-rollover-tail", rollover_tokens,
-                        f"{rollover_day}T10:00:00Z")) + "\n")
+                        _local_ts(rollover_day, 10))) + "\n")
                 os.utime(mid_path, (post_mtime, post_mtime))
                 store.observe_volume("claude", rollover_day, rollover_tokens)
                 record(rollover_day, rollover_tokens)
@@ -980,6 +1024,158 @@ class MaxTrackerStoreEventDateOwnershipTests(unittest.TestCase):
                     f"day {day} has unexpected volume")
 
 
+class MaxTrackerObserveChangeReportingTests(unittest.TestCase):
+    """observe_quota/observe_volume report whether state changed, so the
+    caller can mark the 400-day file dirty only when a save would differ."""
+
+    def test_observe_quota_reports_only_real_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, _, _ = _new_store(directory)
+            ts = datetime.fromisoformat(_backfill_date()).replace(
+                hour=12).astimezone().timestamp()
+
+            self.assertTrue(store.observe_quota("claude", 300, 21.0, ts))
+            self.assertFalse(store.observe_quota("claude", 300, 21.0, ts))
+            self.assertFalse(store.observe_quota("claude", 300, 10.0, ts))
+            self.assertTrue(store.observe_quota("claude", 300, 30.0, ts))
+            # 29.6 rounds to the same recorded peak as 30.0: no change.
+            self.assertFalse(store.observe_quota("claude", 300, 29.6, ts))
+            self.assertFalse(store.observe_quota("claude", 10080, 47.0, ts))
+            self.assertTrue(store.observe_quota("claude", 10080, 100.0, ts))
+            self.assertFalse(store.observe_quota("claude", 10080, 100.0, ts))
+            self.assertTrue(store.observe_quota("codex", None, 5.0, ts))
+            self.assertFalse(store.observe_quota("nope", 300, 21.0, ts))
+            self.assertFalse(store.observe_quota("claude", 300, 21.0, "x"))
+            self.assertFalse(store.observe_quota("claude", -1, 99.0, ts))
+
+    def test_observe_volume_reports_whether_anything_was_added(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, _, _ = _new_store(directory)
+            day = _backfill_date()
+
+            self.assertTrue(store.observe_volume("claude", day, 5))
+            self.assertTrue(store.observe_volume("claude", day, 5))  # sums
+            self.assertFalse(store.observe_volume("claude", day, 0))
+            self.assertFalse(store.observe_volume("claude", "bad-day", 5))
+            self.assertFalse(store.observe_volume("nope", day, 5))
+            self.assertEqual(store._state["claude"]["days"][day]["vol"], 10)
+
+
+class MaxTrackerStaleInodeTests(unittest.TestCase):
+    """_backfill entries are keyed by inode alone. A file that vanishes
+    left its entry behind forever, and on NTFS a recycled st_ino could
+    inherit a stale "done at size N" watermark and skip a brand-new
+    file's first N bytes."""
+
+    def test_vanished_file_drops_its_bookkeeping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, _, claude_root = _new_store(directory)
+            day = _backfill_date()
+            path = claude_root / "session.jsonl"
+            _write_jsonl(path, [_claude_usage_line(
+                "m1", 100, _local_ts(day, 10))])
+            _age_into_last_month(path)
+            ino = path.stat().st_ino
+            _drain(store)
+            self.assertIn(ino, store._backfill["claude"])
+            store._pending["claude"][ino] = b"leftover"
+
+            path.unlink()
+            self.assertFalse(store.backfill_step())
+
+            self.assertNotIn(ino, store._backfill["claude"])
+            self.assertNotIn(ino, store._pending["claude"])
+            # The counted volume itself is history, not bookkeeping.
+            self.assertEqual(store._state["claude"]["days"][day]["vol"], 100)
+
+    def test_vanished_codex_file_drops_its_bookkeeping_too(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, codex_root, _ = _new_store(directory)
+            path = codex_root / "rollout-a.jsonl"
+            _write_jsonl(path, [_rollout_event(
+                _rollout_limits(primary_pct=42.0), "2026-08-07T10:00:00Z")])
+            ino = path.stat().st_ino
+            _drain(store)
+            self.assertIn(ino, store._backfill["codex"])
+
+            path.unlink()
+            store.backfill_step()
+
+            self.assertNotIn(ino, store._backfill["codex"])
+
+    def test_deferred_live_file_keeps_its_watermark_across_passes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, _, claude_root = _new_store(directory)
+            path = claude_root / "session.jsonl"
+            _write_jsonl(path, [_claude_usage_line(
+                "m1", 100, _local_ts(_backfill_date(), 10))])
+            # Fresh mtime: this month's file, deferred to the live channel.
+            ino = path.stat().st_ino
+            store.backfill_step()
+            self.assertIn(ino, store._backfill["claude"])
+
+            store.backfill_step()
+            store.backfill_step()
+
+            self.assertIn(ino, store._backfill["claude"])
+            self.assertTrue(store._backfill["claude"][ino]["done"])
+
+    def test_pruning_survives_a_pass_with_nothing_to_drain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, _, claude_root = _new_store(directory)
+            store._backfill["claude"][987654321] = {
+                "offset": 10, "size": 10, "done": True,
+                "discarding": False}
+            self.assertTrue(claude_root.is_dir())
+
+            self.assertFalse(store.backfill_step())
+
+            self.assertNotIn(987654321, store._backfill["claude"])
+
+    def test_pruned_entries_do_not_come_back_from_disk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "max-tracker.json"
+            store, _, claude_root = _new_store(directory, path=path)
+            file_path = claude_root / "session.jsonl"
+            _write_jsonl(file_path, [_claude_usage_line(
+                "m1", 100, _local_ts(_backfill_date(), 10))])
+            _age_into_last_month(file_path)
+            ino = file_path.stat().st_ino
+            _drain(store)
+            file_path.unlink()
+            store.backfill_step()
+            store.save()
+
+            reloaded = MaxTrackerStore(path, Path(directory) / "codex",
+                                       claude_root)
+
+            self.assertNotIn(ino, reloaded._backfill["claude"])
+
+
+class MaxTrackerMonthBoundaryDstTests(unittest.TestCase):
+    """_current_month_start_ts is a LOCAL midnight; ``astimezone()`` hands
+    out a fixed-offset now, so ``now.replace(day=1)`` kept today's offset
+    and landed an hour off when the 1st sat across a DST transition."""
+
+    def test_month_start_carries_the_first_days_offset(self):
+        zone = _AutumnZone()
+        now = datetime(2026, 4, 20, 12,
+                       tzinfo=timezone(timedelta(hours=12)))  # after
+        with mock.patch.object(
+                max_tracker, "_localize",
+                lambda naive: naive.replace(tzinfo=zone)):
+            start_ts = max_tracker._current_month_start_ts(now)
+
+        expected = datetime(2026, 4, 1, tzinfo=timezone(timedelta(hours=13)))
+        self.assertEqual(start_ts, expected.timestamp())
+
+    def test_default_now_is_the_real_clock_in_local_time(self):
+        before = datetime.now().astimezone()
+        start_ts = max_tracker._current_month_start_ts()
+        first = datetime(before.year, before.month, 1).astimezone()
+        self.assertEqual(start_ts, first.timestamp())
+
+
 class MaxTrackerStoreClaudeBackfillTests(unittest.TestCase):
     def test_claude_volume_backfill_sets_activity_and_volume_never_pct(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -987,8 +1183,8 @@ class MaxTrackerStoreClaudeBackfillTests(unittest.TestCase):
             event_day = _backfill_date()
             path = claude_root / "session.jsonl"
             _write_jsonl(path, [
-                _claude_usage_line("m1", 100, f"{event_day}T10:00:00Z"),
-                _claude_usage_line("m2", 50, f"{event_day}T11:00:00Z"),
+                _claude_usage_line("m1", 100, _local_ts(event_day, 10)),
+                _claude_usage_line("m2", 50, _local_ts(event_day, 11)),
             ])
             _age_into_last_month(path)  # Finding C: else backfill defers it
 
@@ -1358,7 +1554,7 @@ class MaxTrackerStorePrivacySchemaTests(unittest.TestCase):
                     "2026-08-01T10:00:00Z"),
             ])
             _write_jsonl(claude_root / "session.jsonl", [
-                _claude_usage_line("m1", 500, "2026-08-02T10:00:00Z"),
+                _claude_usage_line("m1", 500, _local_ts("2026-08-02", 10)),
             ])
             _drain(store)
             store.observe_quota("claude", 300, 55.0,

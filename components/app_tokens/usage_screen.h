@@ -12,8 +12,19 @@
 #include "max_tracker.h"
 #include "tokens.h"
 
-/* Six base tiles + the optional GitHub tile + the always-present Value tile. */
-#define TK_USAGE_SCREEN_VIEWS (6 + TK_GITHUB_SCREEN_ENABLED + 1)
+/* Seven fixed tiles (six quota/analytics pages + the Value page) followed by
+ * the optional GitHub tile, which is always the LAST index (see the VIEW_*
+ * enum in app_tokens.h). */
+#define TK_USAGE_SCREEN_VIEWS (7 + TK_GITHUB_SCREEN_ENABLED)
+
+/* Per-feed staleness (OBS-09). Each feed goes stale on its OWN clock, at a
+ * threshold above its own poll cadence, so a dead /api/max-tracker or
+ * /api/github can never hide under a healthy /api/tokens. The quota feed
+ * (30 s cadence) and GitHub (30 s) share the 120 s threshold app.c has
+ * always used; Max Tracker polls every 5 min, so two missed polls plus
+ * margin is its honest threshold. */
+#define TK_FEED_STALE_AFTER_US (120LL * 1000000LL)
+#define TK_TRACKER_STALE_AFTER_US (11LL * 60LL * 1000000LL)
 
 void usage_screen_create(lv_obj_t *root);
 void usage_screen_apply_tokens(const tk_tokens *tokens);

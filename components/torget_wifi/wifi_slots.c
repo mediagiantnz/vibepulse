@@ -146,6 +146,28 @@ tg_wifi_join_status tg_wifi_disconnect_status(int reason) {
   }
 }
 
+tg_wifi_join_status tg_wifi_join_next_status(tg_wifi_join_status current,
+                                             bool trial_live,
+                                             bool applied_now, bool have_ip,
+                                             int reason) {
+  if (current == TG_WIFI_JOIN_IDLE || current == TG_WIFI_JOIN_CONNECTED)
+    return current;
+  if (!trial_live) return current;
+  if (applied_now) return current;
+  /* The IP outranks every earlier reason code: it is the only proof that
+   * exists, and it arrived with the trial as the live configuration. */
+  if (have_ip) return TG_WIFI_JOIN_CONNECTED;
+  if (current == TG_WIFI_JOIN_CONNECTING && reason != 0)
+    return tg_wifi_disconnect_status(reason);
+  return current;
+}
+
+tg_wifi_psk_source tg_wifi_ap_psk_source(bool opened_by_hold,
+                                         bool token_available) {
+  if (opened_by_hold && token_available) return TG_WIFI_PSK_TOKEN_DERIVED;
+  return TG_WIFI_PSK_RANDOM;
+}
+
 bool tg_wifi_setup_dma_ok_to_open(size_t largest_dma, size_t flush_bytes) {
   /* flush_bytes == 0 vore en felkonfiguration som gjorde grinden till en
    * papperstiger — behandla den som "vet inte" och vägra. */

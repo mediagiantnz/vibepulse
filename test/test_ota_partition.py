@@ -168,20 +168,54 @@ for symbol in (
 ):
     assert symbol in service, f"ota_service.c must use incremental {symbol}"
 
-# Token comparison must be constant-time, and the Authorization header must
-# never reach a log line.
-assert "constant_time_equal" in service, (
-    "token comparison must go through the constant-time helper"
+# The token never crosses the LAN. The sender proves it with
+# X-VibePulse-Auth = hex(HMAC-SHA256(token, claimed SHA-256 hex)); the device
+# recomputes the HMAC with mbedtls, compares in constant time through the
+# host-tested policy, and re-checks digest + proof after the stream before
+# esp_ota_end may run. No bearer header, no plain token compare, nothing
+# secret in a log line.
+assert "Authorization" not in service, (
+    "the bearer-token header is gone: the sender presents an HMAC proof"
 )
-assert "strcmp(authorization" not in service and (
-    "strncmp(authorization, \"Bearer \"" in service
-), "the bearer prefix check is the only string scan allowed on the header"
+assert '"X-VibePulse-Auth"' in service and '"X-VibePulse-SHA256"' in service
+assert "mbedtls_md_hmac(" in service and "MBEDTLS_MD_SHA256" in service, (
+    "the proof must be recomputed with mbedtls HMAC-SHA256"
+)
+assert "tg_ota_ct_equal(" in service, (
+    "proof comparison must go through the policy's constant-time helper"
+)
+assert "memcmp(actual_sha" not in service, (
+    "the streamed digest must be compared in constant time, not memcmp"
+)
+assert "tg_ota_image_check(" in service, (
+    "the post-stream verdict must come from the host-tested policy"
+)
+assert service.index("tg_ota_image_check(") < service.index("esp_ota_end("), (
+    "digest and proof must be verified before esp_ota_end"
+)
+verdict = service.split("tg_ota_image_check(")[1].split("esp_ota_end(")[0]
+assert verdict.count('"403 Forbidden", "rejected"') == 2, (
+    "both post-stream rejections must answer the same 403 with no detail"
+)
 for line in service.splitlines():
     if "ESP_LOG" in line:
-        assert "authorization" not in line.lower(), (
-            "the Authorization header must never be logged"
-        )
+        lowered = line.lower()
+        for secret in ("authorization", "proof_hex", "sha_hex", "presented_proof",
+                       "expected_proof"):
+            assert secret not in lowered, (
+                f"a header or proof value must never be logged: {line.strip()}"
+            )
         assert "TG_OTA_TOKEN" not in line, "the token must never be logged"
+
+# The chained-update case: while the running slot is PENDING_VERIFY the
+# device must answer 409 (not let esp_ota_begin fail into a 500) and must
+# publish the fact on /api/ota/status so the sender can wait.
+assert '"409 Conflict", "previous image not yet verified"' in service
+assert "TG_OTA_REJECT_PENDING_VERIFY" in service
+assert '\\"pending_verify\\":%s' in service, (
+    "/api/ota/status must publish pending_verify"
+)
+assert "running_pending_verify()" in service.split("static esp_err_t status_get_handler")[1].split("firmware_post_handler")[0]
 
 # The pure policy stays the gatekeeper: the HTTP layer maps its request and
 # asks before esp_ota_begin may touch flash.

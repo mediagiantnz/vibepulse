@@ -182,39 +182,16 @@ int main(void) {
   check_unavailable_bar("nonpositive width is rejected", 9, true, 1, true,
                         0);
 
-  check("missing new data is silent",
-        usage_live_choose_update(true, false, true, true, 10, false, 0) ==
-            USAGE_UPDATE_SILENT);
-  check("nonfinite new data is silent",
-        usage_live_choose_update(true, false, true, true, 10, true, NAN) ==
-            USAGE_UPDATE_SILENT);
-  check("first accepted load is direct",
-        usage_live_choose_update(false, false, true, false, 0, true, 10) ==
-            USAGE_UPDATE_DIRECT);
-  check("first accepted stale sample is silent",
-        usage_live_choose_update(false, true, true, false, 0, true, 10) ==
-            USAGE_UPDATE_SILENT);
-  check("first accepted hidden sample is silent",
-        usage_live_choose_update(false, false, false, false, 0, true, 10) ==
-            USAGE_UPDATE_SILENT);
-  check("stale accepted sample is silent",
-        usage_live_choose_update(true, true, true, true, 10, true, 20) ==
-            USAGE_UPDATE_SILENT);
-  check("hidden accepted sample is silent",
-        usage_live_choose_update(true, false, false, true, 10, true, 20) ==
-            USAGE_UPDATE_SILENT);
-  check("visible fresh increase animates forward",
-        usage_live_choose_update(true, false, true, true, 10, true, 20) ==
-            USAGE_UPDATE_ANIMATE_FORWARD);
-  check("newer increase during animation is another forward decision",
-        usage_live_choose_update(true, false, true, true, 20, true, 30) ==
-            USAGE_UPDATE_ANIMATE_FORWARD);
-  check("visible fresh decrease snaps backward",
-        usage_live_choose_update(true, false, true, true, 20, true, 10) ==
-            USAGE_UPDATE_SNAP_BACKWARD);
-  check("visible fresh equal value is direct",
-        usage_live_choose_update(true, false, true, true, 20, true, 20) ==
-            USAGE_UPDATE_DIRECT);
+  /* The header applies ONE freshness rule (agent_monitor_policy): a parked
+   * WAITING can be an hour old on the server and still count, as long as
+   * the packet carrying it is within the lease. */
+  tk_agent_provider_status parked_old = {0};
+  add_job(&parked_old, job(TK_AGENT_WAITING, 3600000, NULL, NULL));
+  check_header("an hour-old parked question still counts in a fresh packet",
+               &parked_old, 0, false, true, "1 AGENT ACTIVE", false);
+  check_header("the same question expires with the packet, not its own age",
+               &parked_old, TK_AGENT_WORKING_LEASE_MS + 1, false, true,
+               "NO ACTIVE AGENT", false);
 
   if (!failures) {
     printf("OK: live quota policy tests green\n");

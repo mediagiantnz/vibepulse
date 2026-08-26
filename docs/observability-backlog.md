@@ -156,7 +156,7 @@ the honesty invariant ("never makes numbers up").
 when recomputes keep failing.
 
 ### OBS-09 · Staleness is one clock fed by one endpoint
-`firmware · M · open`
+`firmware · M · partial (2026-08-26: the Max Tracker and GitHub pages now go stale on their own feed; the agent feed still shows NO ACTIVE AGENT when it dies, copy decision and AMOLED review pending)`
 `last_success_us` is written only by `/api/tokens` successes
 (`components/app_tokens/app.c:34`) but the derived `stale` flag is OR-ed
 into every page (`usage_screen.c:450,458`). If `/api/max-tracker`
@@ -373,8 +373,10 @@ has `-Wall -Wextra -Werror` in the test gate). Several audit findings
 bug-shaped rules, not the style ones.
 
 ### OBS-26 · design-qa.md contradicts the physical review
-`docs · S · open`
-`design-qa.md` still says the physical AMOLED gate is outstanding and
+`docs · S · done (2026-08-26)` - moved to `docs/design-qa-2026-08-07.md`
+with a status header naming the passed gate and `docs/superpowers/reviews/`
+as the live record; the dead `work/design-qa/…` reference is gone.
+`design-qa.md` still said the physical AMOLED gate is outstanding and
 points at `work/design-qa/…`, a path that doesn't exist —
 contradicting `AGENTS.md` and the 2026-08-13 review that marked the
 static gate PASSED. Doc drift is this repo's most-repeated mistake

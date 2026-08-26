@@ -49,10 +49,28 @@ typedef struct {
 } body_t;
 
 static esp_err_t on_event(esp_http_client_event_t *evt) {
-  if (evt->event_id != HTTP_EVENT_ON_DATA) return ESP_OK;
-
   body_t *b = (body_t *)evt->user_data;
-  if (!b || b->overflow) return ESP_OK;
+  if (!b) return ESP_OK;
+
+  /* One body per REQUEST, not per perform. With max_redirection_count > 0
+   * esp_http_client (IDF 5.5.2, esp_http_client_perform) reads the 3xx
+   * response's body through http_on_body, which dispatches HTTP_EVENT_ON_DATA
+   * to this handler, and only then re-sends the request to the new
+   * Location. Without a reset the buffer became "<html>...{json}" and the
+   * parsers rejected a perfectly good redirected payload. HEADERS_SENT
+   * fires once per request (also for the automatic re-send), so it is the
+   * honest reset point. HTTP_EVENT_REDIRECT reaches this handler only when
+   * disable_auto_redirect is set (with auto-redirect IDF posts it to the
+   * event loop instead); it is handled too so a future manual-redirect
+   * caller gets the same clean slate. */
+  if (evt->event_id == HTTP_EVENT_HEADERS_SENT ||
+      evt->event_id == HTTP_EVENT_REDIRECT) {
+    b->len = 0;
+    b->overflow = false;
+    return ESP_OK;
+  }
+  if (evt->event_id != HTTP_EVENT_ON_DATA) return ESP_OK;
+  if (b->overflow) return ESP_OK;
 
   if (b->len + (size_t)evt->data_len >= b->cap) {
     b->overflow = true;

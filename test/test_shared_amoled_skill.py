@@ -17,6 +17,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / ".claude/skills/iterating-esp32-amoled-ui"
 INSTALLER = ROOT / "tools/install-local-skills.sh"
 SKILL_NAME = "iterating-esp32-amoled-ui"
+# The installer is POSIX sh. Windows cannot exec it directly; Git Bash can
+# run it, and MSYS must be told to create real symlinks rather than copies.
+BASH = shutil.which("bash") if os.name == "nt" else None
 
 
 def run(command: list[str], *, cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -27,6 +30,55 @@ def run(command: list[str], *, cwd: Path, check: bool = True) -> subprocess.Comp
         capture_output=True,
         check=check,
     )
+
+
+def _symlinks_available() -> bool:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        try:
+            os.symlink(temp_dir, os.path.join(temp_dir, "probe"),
+                       target_is_directory=True)
+        except (OSError, NotImplementedError):
+            return False
+    return True
+
+
+def requires_installer_runtime(test):
+    """The installer needs a POSIX shell and symlink rights. Locally that
+    may be missing (Windows without Git Bash or Developer Mode); on CI it
+    must never be, so a missing runtime fails instead of skipping."""
+    reasons = []
+    if os.name == "nt" and BASH is None:
+        reasons.append("Git Bash is not on PATH")
+    if not _symlinks_available():
+        reasons.append("symlink creation is not permitted")
+    if not reasons:
+        return test
+    reason = "; ".join(reasons)
+    if os.environ.get("CI"):
+        def fail(self):
+            self.fail(f"installer tests cannot run on CI: {reason}")
+        fail.__name__ = test.__name__
+        fail.__doc__ = test.__doc__
+        return fail
+    return unittest.skip(reason)(test)
+
+
+def installer_command(installer: Path) -> list[str]:
+    if os.name == "nt":
+        return [BASH, installer.as_posix()]
+    return [str(installer)]
+
+
+def installer_env(codex_home: Path) -> dict[str, str]:
+    env = {**os.environ, "CODEX_HOME": codex_home.as_posix()}
+    if os.name == "nt":
+        env["MSYS"] = "winsymlinks:nativestrict"
+    return env
+
+
+def path_as_printed(path: Path) -> str:
+    """The installer echoes CODEX_HOME verbatim plus POSIX-joined parts."""
+    return path.as_posix() if os.name == "nt" else str(path)
 
 
 def commit_fixture_repo(primary: Path) -> None:
@@ -134,6 +186,7 @@ class SharedAmoledSkillTests(unittest.TestCase):
             },
         )
 
+    @requires_installer_runtime
     def test_linked_worktree_installer_targets_primary_and_handles_existing_targets(
         self,
     ) -> None:
@@ -156,9 +209,10 @@ class SharedAmoledSkillTests(unittest.TestCase):
             run(["git", "worktree", "add", "-b", "linked-test", str(linked)], cwd=primary)
 
             linked_installer = linked / "tools/install-local-skills.sh"
-            env = {**os.environ, "CODEX_HOME": str(codex_home)}
+            command = installer_command(linked_installer)
+            env = installer_env(codex_home)
             result = subprocess.run(
-                [str(linked_installer)],
+                command,
                 cwd=linked,
                 env=env,
                 text=True,
@@ -168,11 +222,11 @@ class SharedAmoledSkillTests(unittest.TestCase):
             link = codex_home / "skills" / SKILL_NAME
             self.assertTrue(link.is_symlink())
             self.assertEqual(link.resolve(), primary_skill.resolve())
-            self.assertIn(str(link), result.stdout)
+            self.assertIn(path_as_printed(link), result.stdout)
             self.assertIn("new Codex session", result.stdout)
 
             subprocess.run(
-                [str(linked_installer)],
+                command,
                 cwd=linked,
                 env=env,
                 text=True,
@@ -186,7 +240,7 @@ class SharedAmoledSkillTests(unittest.TestCase):
             link.unlink()
             link.symlink_to(foreign, target_is_directory=True)
             subprocess.run(
-                [str(linked_installer)],
+                command,
                 cwd=linked,
                 env=env,
                 text=True,
@@ -198,7 +252,7 @@ class SharedAmoledSkillTests(unittest.TestCase):
             link.unlink()
             link.symlink_to(base / "Missing Skill", target_is_directory=True)
             subprocess.run(
-                [str(linked_installer)],
+                command,
                 cwd=linked,
                 env=env,
                 text=True,
@@ -210,7 +264,7 @@ class SharedAmoledSkillTests(unittest.TestCase):
             link.unlink()
             link.write_text("keep me", encoding="utf-8")
             refused = subprocess.run(
-                [str(linked_installer)],
+                command,
                 cwd=linked,
                 env=env,
                 text=True,
@@ -223,7 +277,7 @@ class SharedAmoledSkillTests(unittest.TestCase):
             link.mkdir()
             (link / "keep-me").write_text("directory", encoding="utf-8")
             refused = subprocess.run(
-                [str(linked_installer)],
+                command,
                 cwd=linked,
                 env=env,
                 text=True,
@@ -232,30 +286,40 @@ class SharedAmoledSkillTests(unittest.TestCase):
             self.assertNotEqual(refused.returncode, 0)
             self.assertEqual((link / "keep-me").read_text(encoding="utf-8"), "directory")
 
-    def test_real_premerge_installer_refuses_when_primary_skill_is_absent(self) -> None:
-        common_dir = Path(
-            run(
-                ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                cwd=ROOT,
-            ).stdout.strip()
-        )
-        primary_skill = common_dir.parent / ".claude/skills" / SKILL_NAME
-        if primary_skill.is_dir():
-            self.skipTest("primary checkout already contains the merged skill")
+    @requires_installer_runtime
+    def test_premerge_installer_refuses_when_primary_skill_is_absent(self) -> None:
+        # A checkout from before the skill merged: installer present, skill
+        # absent. Built in a temp directory so the case is exercised on every
+        # run instead of being skipped whenever this checkout has the skill.
+        with tempfile.TemporaryDirectory(prefix="amoled skill premerge ") as temp_dir:
+            base = Path(temp_dir)
+            primary = base / "Primary Repo"
+            primary.mkdir()
+            primary_installer = primary / "tools/install-local-skills.sh"
+            primary_installer.parent.mkdir()
+            shutil.copy2(INSTALLER, primary_installer)
+            commit_fixture_repo(primary)
+            linked = base / "Linked Worktree"
+            run(["git", "worktree", "add", "-b", "premerge-linked", str(linked)], cwd=primary)
+            codex_home = base / "Codex Home"
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            codex_home = Path(temp_dir) / "codex-home"
-            refused = subprocess.run(
-                [str(INSTALLER)],
-                cwd=ROOT,
-                env={**os.environ, "CODEX_HOME": str(codex_home)},
-                text=True,
-                capture_output=True,
-            )
-            self.assertNotEqual(refused.returncode, 0)
-            self.assertIn("primary checkout", refused.stderr)
-            self.assertIn("merge", refused.stderr.lower())
-            self.assertFalse((codex_home / "skills" / SKILL_NAME).exists())
+            for label, installer, cwd in (
+                ("primary", primary_installer, primary),
+                ("linked worktree", linked / "tools/install-local-skills.sh", linked),
+            ):
+                with self.subTest(checkout=label):
+                    refused = subprocess.run(
+                        installer_command(installer),
+                        cwd=cwd,
+                        env=installer_env(codex_home),
+                        text=True,
+                        capture_output=True,
+                    )
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertIn("primary checkout", refused.stderr)
+                    self.assertIn("merge", refused.stderr.lower())
+                    # Refusal comes before any write: not even CODEX_HOME.
+                    self.assertFalse(codex_home.exists())
 
     def test_both_agents_route_visual_work_through_the_physical_gate(self) -> None:
         for filename in ("AGENTS.md", "CLAUDE.md"):

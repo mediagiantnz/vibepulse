@@ -13,10 +13,16 @@
  * Åtkomstkontrollen ÄR sökvägen: /u/<hemlighet>/api/... där hemligheten
  * är minst 32 slumpade byte ur secrets.h (TK_VIBEPULSE_RELAY_URL). Samma
  * skyddsnivå som en privat delningslänk — rätt nivå för procentsiffror,
- * och skälet till att inget känsligare än siffror får bo här.
+ * och skälet till att inget känsligare än siffror får bo här. Eftersom
+ * URL:en är nyckeln jämförs den i konstant tid (guard.js), varje svar är
+ * Cache-Control: no-store, och plattformens invocation logs (som sparar
+ * URL:en i sju dagar) är avstängda i wrangler-konfigurationen.
  *
  * Flera avsändare (en Mac som sover, en alltid-på-PC) publicerar till
- * samma brevlåda under eget namn. Läsningen slår ihop dem:
+ * samma brevlåda under eget namn (maskinens korta värdnamn). Brevlådan
+ * har åtta platser; en nionde avsändare knuffar ut den vars senaste
+ * dokument är äldst, aldrig den som just publicerar. Läsningen slår ihop
+ * dem:
  *
  *   /api/tokens      — färskast VINNER PER POOL: varje kvotpool bär redan
  *                      sin egen observationsstämpel
@@ -39,11 +45,14 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { mergeTokens, newestBody } from "./merge.js";
+import {
+  MAX_BODY_BYTES, bodyShapeProblem, jsonResponse, readNumbersBody,
+  resolveEndpoint, textResponse, utf8ByteLength,
+} from "./guard.js";
 
 export { mergeTokens, newestBody };
 
 const ENDPOINTS = ["/api/tokens", "/api/max-tracker", "/api/github"];
-const MAX_BODY_BYTES = 64 * 1024; // largest honest payload is ~8 kB
 const MAX_PUBLISHERS = 8;
 const PUBLISHER_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
 const MAILBOX_NAME = "numbers-mailbox-v1";
@@ -87,9 +96,17 @@ export class NumbersMailbox extends DurableObject {
     if (typeof publisher !== "string" ||
         !PUBLISHER_PATTERN.test(publisher))
       throw new RangeError("invalid publisher");
-    if (typeof bodyJson !== "string" || bodyJson.length > MAX_BODY_BYTES)
+    if (typeof bodyJson !== "string" ||
+        utf8ByteLength(bodyJson) > MAX_BODY_BYTES)
       throw new RangeError("invalid body");
-    JSON.parse(bodyJson);
+    const body = JSON.parse(bodyJson);
+    if (bodyShapeProblem(body) !== null)
+      throw new RangeError("invalid body");
+    // A publisher's clock is not trusted past the moment of receipt: a fast
+    // clock would otherwise win every pool for as long as it stays ahead.
+    // Older stamps are kept as claimed (a republished stale cache keeps its
+    // original observation time).
+    const storedJson = clampObservedAt(body, bodyJson, Date.now() / 1000);
 
     return this.ctx.storage.transactionSync(() => {
       const registered = this.ctx.storage.sql.exec(`
@@ -99,7 +116,7 @@ export class NumbersMailbox extends DurableObject {
         const count = this.ctx.storage.sql.exec(
           "SELECT COUNT(*) AS count FROM publishers",
         ).one().count;
-        if (count >= MAX_PUBLISHERS) return "full";
+        if (count >= MAX_PUBLISHERS) this.evictQuietest();
         this.ctx.storage.sql.exec(
           "INSERT INTO publishers (publisher) VALUES (?)", publisher,
         );
@@ -118,9 +135,32 @@ export class NumbersMailbox extends DurableObject {
         ON CONFLICT(endpoint, publisher) DO UPDATE SET
           received_at = excluded.received_at,
           body_json = excluded.body_json
-      `, endpoint, publisher, receivedAt, bodyJson);
+      `, endpoint, publisher, receivedAt, storedJson);
       return "stored";
     });
+  }
+
+  // Runs inside publish's transaction, only for an unregistered publisher,
+  // so the arriving name can never be the one removed. The evicted name is
+  // the registered publisher whose newest document is oldest; a name with
+  // no document at all (should not happen: registration and its document
+  // commit together) is removed first.
+  evictQuietest() {
+    const quietest = this.ctx.storage.sql.exec(`
+      SELECT p.publisher AS publisher, MAX(d.received_at) AS newest
+      FROM publishers AS p
+      LEFT JOIN documents AS d ON d.publisher = p.publisher
+      GROUP BY p.publisher
+      ORDER BY newest ASC, p.publisher ASC
+      LIMIT 1
+    `).toArray()[0];
+    if (quietest === undefined) return;
+    this.ctx.storage.sql.exec(
+      "DELETE FROM documents WHERE publisher = ?", quietest.publisher,
+    );
+    this.ctx.storage.sql.exec(
+      "DELETE FROM publishers WHERE publisher = ?", quietest.publisher,
+    );
   }
 
   async getDocs(endpoint) {
@@ -154,12 +194,18 @@ export class NumbersMailbox extends DurableObject {
   }
 }
 
-function parsePath(url, secret) {
-  const prefix = `/u/${secret}`;
-  const path = new URL(url).pathname;
-  if (!path.startsWith(prefix + "/")) return null;
-  const endpoint = path.slice(prefix.length);
-  return ENDPOINTS.includes(endpoint) ? endpoint : null;
+function clampObservedAt(body, bodyJson, receivedWall) {
+  let clamped = false;
+  for (const key of Object.keys(body)) {
+    const value = body[key];
+    if (key.endsWith("ObservedAt") && typeof value === "number" &&
+        value > receivedWall) {
+      body[key] = receivedWall;
+      clamped = true;
+    }
+  }
+  // Unchanged documents keep the publisher's exact bytes.
+  return clamped ? JSON.stringify(body) : bodyJson;
 }
 
 function assertEndpoint(endpoint) {
@@ -189,37 +235,33 @@ export default {
     // aldrig kod. Utan den svarar brevlådan ingenting alls.
     const secret = env.RELAY_SECRET;
     if (!secret || secret.length < 32)
-      return new Response("relay not configured", { status: 503 });
+      return textResponse("relay not configured", 503);
 
-    const endpoint = parsePath(request.url, secret);
-    if (endpoint === null) return new Response("not found", { status: 404 });
+    const endpoint = await resolveEndpoint(request.url, secret, ENDPOINTS);
+    if (endpoint === null) return textResponse("not found", 404);
 
     if (request.method === "POST" || request.method === "PUT") {
       const publisher =
           (request.headers.get("X-VibePulse-Publisher") || "unnamed")
               .slice(0, 64).replace(/[^A-Za-z0-9._-]/g, "_");
-      const raw = await request.text();
-      if (raw.length > MAX_BODY_BYTES)
-        return new Response("too large", { status: 413 });
-      try {
-        JSON.parse(raw);
-      } catch {
-        return new Response("not json", { status: 400 });
-      }
+      const read = await readNumbersBody(request);
+      if (read.response !== undefined) return read.response;
       let result;
       try {
-        result = await mailbox(env).publish(endpoint, publisher, raw);
+        result = await mailbox(env).publish(endpoint, publisher, read.raw);
       } catch {
         logMailboxFailure("publish");
-        return new Response("relay unavailable", { status: 503 });
+        return textResponse("relay unavailable", 503);
       }
+      // The mailbox now evicts instead of refusing, but the strict answer
+      // stays mapped so an older mailbox build cannot turn into a 503.
       if (result === "full")
-        return new Response("too many publishers", { status: 409 });
+        return textResponse("too many publishers", 409);
       if (result !== "stored") {
         logMailboxFailure("publish");
-        return new Response("relay unavailable", { status: 503 });
+        return textResponse("relay unavailable", 503);
       }
-      return new Response("ok", { status: 200 });
+      return textResponse("ok", 200);
     }
 
     if (request.method === "GET") {
@@ -228,18 +270,14 @@ export default {
         docs = await mailbox(env).getDocs(endpoint);
       } catch {
         logMailboxFailure("read");
-        return new Response("relay unavailable", { status: 503 });
+        return textResponse("relay unavailable", 503);
       }
       const merged = endpoint === "/api/tokens" ? mergeTokens(docs)
                                                 : newestBody(docs);
-      if (merged === null)
-        return new Response(JSON.stringify({ error: "no data yet" }),
-                            { status: 404,
-                              headers: { "Content-Type": "application/json" } });
-      return new Response(JSON.stringify(merged),
-                          { headers: { "Content-Type": "application/json" } });
+      if (merged === null) return jsonResponse({ error: "no data yet" }, 404);
+      return jsonResponse(merged);
     }
 
-    return new Response("method not allowed", { status: 405 });
+    return textResponse("method not allowed", 405);
   },
 };

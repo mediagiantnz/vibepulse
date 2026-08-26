@@ -76,7 +76,7 @@ function productionConfig({
     main,
     compatibility_date: "2026-08-22",
     compatibility_flags: ["nodejs_compat"],
-    observability: { enabled: true },
+    observability: { enabled: true, logs: { invocation_logs: false } },
     durable_objects: {
       bindings: [{
         name: "NUMBERS_MAILBOX",
@@ -192,6 +192,12 @@ test("invalid production configs never reach a child process", async (t) => {
   wrongObservability.observability.enabled = false;
   const extraObservabilityKey = productionConfig();
   extraObservabilityKey.observability.head_sampling_rate = 1;
+  const missingLogs = productionConfig();
+  delete missingLogs.observability.logs;
+  const invocationLogsOn = productionConfig();
+  invocationLogsOn.observability.logs.invocation_logs = true;
+  const extraLogsKey = productionConfig();
+  extraLogsKey.observability.logs.head_sampling_rate = 1;
   const extraKv = productionConfig();
   extraKv.kv_namespaces.push({
     binding: "OTHER_KV", id: "c".repeat(32),
@@ -243,6 +249,9 @@ test("invalid production configs never reach a child process", async (t) => {
     options(privateConfig(t, extraFlag)),
     options(privateConfig(t, wrongObservability)),
     options(privateConfig(t, extraObservabilityKey)),
+    options(privateConfig(t, missingLogs)),
+    options(privateConfig(t, invocationLogsOn)),
+    options(privateConfig(t, extraLogsKey)),
     options(privateConfig(t, extraKv)),
     options(privateConfig(t, extraKvKey)),
     options(privateConfig(t, extraDurableObjectKey)),
@@ -562,5 +571,10 @@ test("committed configs are test-only while plain Wrangler is disabled",
     assert.deepEqual(config.kv_namespaces, [{
       binding: "VIBEPULSE", id: ZERO_KV_ID,
     }]);
+    // Invocation logs keep the secret URL for seven days; only the app's
+    // own metadata-only console output may reach Workers Logs.
+    assert.deepEqual(config.observability, {
+      enabled: true, logs: { invocation_logs: false },
+    });
   }
 });

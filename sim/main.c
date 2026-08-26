@@ -115,7 +115,9 @@ int64_t torget_now_us(void) { return (int64_t)lv_tick_get() * 1000; }
  * message the device would sign and POST — the exact bytes the send policy
  * builds, so the wire is provable by fake-panel while the screens are provable
  * here, and the shared policy proves they agree. */
-static void sim_needs_you_verdict(tk_needs_you_verdict verdict,
+/* The simulator's print IS its queue: a printed verdict counts as queued, so
+ * every capture (including the ON IT payoff) stays byte-identical. */
+static bool sim_needs_you_verdict(tk_needs_you_verdict verdict,
                                   const tk_ir_decision_context *context) {
   const char *name = tk_needs_you_verdict_name(verdict);
   char message[TK_NEEDS_YOU_MESSAGE_CAP];
@@ -140,6 +142,7 @@ static void sim_needs_you_verdict(tk_needs_you_verdict verdict,
   } else {
     printf("needs-you verdict: (unsendable)\n");
   }
+  return written > 0;
 }
 
 /* ------------------------------------------------------------------ BMP:er */

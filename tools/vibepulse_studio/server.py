@@ -3,7 +3,7 @@
 
 import argparse
 import base64
-import fcntl
+import errno
 import hashlib
 import hmac
 import io
@@ -27,6 +27,18 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 from PIL import Image, UnidentifiedImageError
+
+# The cross-process repository lock is taken with different system calls on
+# different platforms; neither module exists on both. Same pattern as the
+# tokenserver's probe lock: the import must not take the studio down.
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:  # macOS/Linux
+    msvcrt = None
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if str(REPOSITORY_ROOT) not in sys.path:
@@ -105,6 +117,10 @@ JOURNAL_RELATIVE = (
 )
 EXPORT_DIRECTORY = ("design", "vibepulse", "exports")
 LOCK_DIRECTORY = ("design", "vibepulse")
+# Windows cannot flock a directory handle; the path-anchored store locks a
+# byte of this regular file inside LOCK_DIRECTORY instead.
+LOCK_FILE_NAME = ".studio.lock"
+_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
 _COORDINATORS_GUARD = threading.Lock()
 _COORDINATORS = {}
 
@@ -207,7 +223,26 @@ def _content_type(headers):
     return value.split(";", 1)[0].strip().lower()
 
 
-class RepositoryStore:
+class _RepositoryPaths:
+    """Lexical path rules shared by both store implementations."""
+
+    root_path = None
+
+    def relative_from_supplied(self, path):
+        supplied = Path(os.path.abspath(os.fspath(path)))
+        try:
+            relative = supplied.relative_to(self.root_path)
+        except ValueError as error:
+            raise ValueError("design path must stay inside repository") from error
+        if not relative.parts:
+            raise ValueError("design path must name a repository file")
+        return relative.parts
+
+    def display_path(self, parts):
+        return self.root_path.joinpath(*parts)
+
+
+class RepositoryStore(_RepositoryPaths):
     """Descriptor-anchored access to a trusted repository directory."""
 
     def __init__(self, repository_root):
@@ -227,19 +262,6 @@ class RepositoryStore:
         metadata = os.fstat(self.root_fd)
         self.identity = (metadata.st_dev, metadata.st_ino)
         self._finalizer = weakref.finalize(self, os.close, self.root_fd)
-
-    def relative_from_supplied(self, path):
-        supplied = Path(os.path.abspath(os.fspath(path)))
-        try:
-            relative = supplied.relative_to(self.root_path)
-        except ValueError as error:
-            raise ValueError("design path must stay inside repository") from error
-        if not relative.parts:
-            raise ValueError("design path must name a repository file")
-        return relative.parts
-
-    def display_path(self, parts):
-        return self.root_path.joinpath(*parts)
 
     def _directory_fd(self, parts, create=False, mode=0o755):
         current = os.dup(self.root_fd)
@@ -337,7 +359,8 @@ class RepositoryStore:
             )
             with os.fdopen(descriptor, "wb") as output:
                 descriptor = None
-                os.fchmod(output.fileno(), mode)
+                if hasattr(os, "fchmod"):
+                    os.fchmod(output.fileno(), mode)
                 output.write(content)
                 output.flush()
                 os.fsync(output.fileno())
@@ -381,8 +404,250 @@ class RepositoryStore:
         return self._directory_fd(LOCK_DIRECTORY, create=True)
 
 
+def _identity(metadata):
+    return (metadata.st_dev, metadata.st_ino)
+
+
+def _is_reparse_point(metadata):
+    """Symlinks and junctions alike: anything that redirects the walk."""
+    return (stat.S_ISLNK(metadata.st_mode)
+            or bool(getattr(metadata, "st_file_attributes", 0)
+                    & _REPARSE_POINT))
+
+
+class PathRepositoryStore(_RepositoryPaths):
+    """Path-anchored fallback for platforms without dir_fd (Windows).
+
+    The descriptor store anchors every step at an open directory and asks
+    the kernel to refuse symlinks. Windows offers neither, so this store
+    proves the same properties per step instead: every component is lstat'd
+    and refused if it is a reparse point or not the expected kind, and every
+    opened file is fstat'd and refused unless it is the very object that was
+    lstat'd a moment earlier. A swap between those two calls therefore
+    yields a different identity, never a followed link.
+    """
+
+    def __init__(self, repository_root):
+        self.root_path = Path(os.path.abspath(os.fspath(repository_root)))
+        try:
+            metadata = os.lstat(self.root_path)
+        except OSError as error:
+            raise UnsafeRepositoryPath(
+                "repository root must be a real directory, not a symlink"
+            ) from error
+        if _is_reparse_point(metadata):
+            raise UnsafeRepositoryPath(
+                "repository root must be a real directory, not a symlink"
+            )
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise UnsafeRepositoryPath("repository root is not a directory")
+        self.identity = _identity(metadata)
+
+    @staticmethod
+    def _open_flags():
+        return (getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
+                | getattr(os, "O_CLOEXEC", 0))
+
+    def _directory_path(self, parts, create=False, mode=0o755):
+        current = self.root_path
+        for part in parts:
+            if part in ("", ".", "..") or "/" in part or "\\" in part:
+                raise UnsafeRepositoryPath("invalid repository path part")
+            following = current / part
+            try:
+                try:
+                    metadata = os.lstat(following)
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    try:
+                        os.mkdir(following, mode)
+                    except FileExistsError:
+                        pass
+                    metadata = os.lstat(following)
+            except FileNotFoundError:
+                raise
+            except OSError as error:
+                raise UnsafeRepositoryPath(
+                    "repository path component is not a real directory "
+                    "or is a symlink"
+                ) from error
+            if _is_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
+                raise UnsafeRepositoryPath(
+                    "repository path component is not a real directory "
+                    "or is a symlink"
+                )
+            current = following
+        return current
+
+    def _parent_path(self, parts, create=False):
+        if not parts or parts[-1] in ("", ".", ".."):
+            raise UnsafeRepositoryPath("invalid repository file path")
+        return self._directory_path(parts[:-1], create=create)
+
+    def _regular_target(self, parent, name):
+        """lstat a would-be regular file; None when it does not exist."""
+        if name in ("", ".", "..") or "/" in name or "\\" in name:
+            raise UnsafeRepositoryPath("invalid repository file path")
+        try:
+            metadata = os.lstat(parent / name)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise UnsafeRepositoryPath(
+                "repository file is not a regular file or is a symlink"
+            ) from error
+        if _is_reparse_point(metadata) or not stat.S_ISREG(metadata.st_mode):
+            raise UnsafeRepositoryPath(
+                "repository file is not a regular file or is a symlink"
+            )
+        return metadata
+
+    def _open_regular(self, parent, name):
+        before = self._regular_target(parent, name)
+        if before is None:
+            raise FileNotFoundError(errno.ENOENT, "no such repository file",
+                                    str(parent / name))
+        try:
+            descriptor = os.open(parent / name, os.O_RDONLY | self._open_flags())
+        except FileNotFoundError:
+            raise
+        except OSError as error:
+            raise UnsafeRepositoryPath(
+                "repository file is not a regular file or is a symlink"
+            ) from error
+        after = os.fstat(descriptor)
+        if (not stat.S_ISREG(after.st_mode)
+                or _identity(after) != _identity(before)):
+            os.close(descriptor)
+            raise UnsafeRepositoryPath("repository target is not a regular file")
+        return descriptor
+
+    def read(self, parts, *, missing_ok=False, limit=MAX_REQUEST_BYTES):
+        try:
+            parent = self._parent_path(parts)
+            descriptor = self._open_regular(parent, parts[-1])
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
+        with os.fdopen(descriptor, "rb") as source:
+            data = source.read(limit + 1)
+        if len(data) > limit:
+            raise OSError("repository file exceeds safe size")
+        return data
+
+    def _target_is_safe(self, parent, name):
+        self._regular_target(parent, name)
+
+    def atomic_write(self, parts, content, mode=0o644):
+        parent = self._parent_path(parts, create=True)
+        temporary = parent / f".{parts[-1]}.{uuid.uuid4().hex}.tmp"
+        descriptor = None
+        try:
+            self._target_is_safe(parent, parts[-1])
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | self._open_flags()
+            descriptor = os.open(temporary, flags, 0o600)
+            with os.fdopen(descriptor, "wb") as output:
+                descriptor = None
+                if hasattr(os, "fchmod"):
+                    os.fchmod(output.fileno(), mode)
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            # Re-check right before the replace: the swap window between
+            # the check above and this call is the one a symlink attack
+            # would use, and the descriptor store closes it with dir_fd.
+            self._target_is_safe(parent, parts[-1])
+            os.replace(temporary, parent / parts[-1])
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    def remove(self, parts, *, missing_ok=False):
+        try:
+            parent = self._parent_path(parts)
+        except FileNotFoundError:
+            if missing_ok:
+                return
+            raise
+        if self._regular_target(parent, parts[-1]) is None:
+            if missing_ok:
+                return
+            raise FileNotFoundError(errno.ENOENT, "no such repository file",
+                                    str(parent / parts[-1]))
+        os.unlink(parent / parts[-1])
+
+    def lock_directory_fd(self):
+        """Open the regular lock file inside LOCK_DIRECTORY, never a link."""
+        directory = self._directory_path(LOCK_DIRECTORY, create=True)
+        target = directory / LOCK_FILE_NAME
+        flags = os.O_RDWR | os.O_CREAT | self._open_flags()
+        try:
+            return os.open(target, flags | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        before = self._regular_target(directory, LOCK_FILE_NAME)
+        if before is None:
+            raise UnsafeRepositoryPath("repository lock file disappeared")
+        descriptor = os.open(target, flags, 0o600)
+        after = os.fstat(descriptor)
+        if (not stat.S_ISREG(after.st_mode)
+                or _identity(after) != _identity(before)):
+            os.close(descriptor)
+            raise UnsafeRepositoryPath("repository lock file is not regular")
+        return descriptor
+
+
+def _supports_descriptor_store():
+    return (hasattr(os, "O_DIRECTORY")
+            and os.open in os.supports_dir_fd
+            and os.mkdir in os.supports_dir_fd
+            and os.unlink in os.supports_dir_fd
+            and os.replace in os.supports_dir_fd)
+
+
+def repository_store(repository_root):
+    """Pick the strongest store the platform can honour."""
+    if _supports_descriptor_store():
+        return RepositoryStore(repository_root)
+    return PathRepositoryStore(repository_root)
+
+
+def _acquire_exclusive(descriptor):
+    """Block until this process owns the repository lock."""
+    if fcntl is not None:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return
+    if msvcrt is None:
+        raise OSError("no supported cross-process lock backend")
+    # LK_LOCK gives up after ten one-second attempts with EACCES/EDEADLOCK;
+    # flock(LOCK_EX) never gives up, so neither does this.
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        try:
+            msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+            return
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EDEADLOCK,
+                                   getattr(errno, "EDEADLK", errno.EDEADLOCK)):
+                raise
+
+
+def _release_exclusive(descriptor):
+    if fcntl is not None:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    elif msvcrt is not None:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+
+
 class RepositoryCoordinator:
-    """One reentrant process lock plus one cross-process flock per repo."""
+    """One reentrant process lock plus one cross-process file lock per repo."""
 
     def __init__(self):
         self.process_lock = threading.RLock()
@@ -395,7 +660,7 @@ class RepositoryCoordinator:
             if depth == 0:
                 descriptor = store.lock_directory_fd()
                 try:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    _acquire_exclusive(descriptor)
                 except BaseException:
                     os.close(descriptor)
                     raise
@@ -408,7 +673,7 @@ class RepositoryCoordinator:
                 if self.local.depth == 0:
                     descriptor = self.local.descriptor
                     try:
-                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                        _release_exclusive(descriptor)
                     finally:
                         os.close(descriptor)
                         del self.local.descriptor
@@ -529,7 +794,7 @@ class StudioApplication:
     """Pure request boundary shared by tests and the HTTP adapter."""
 
     def __init__(self, repository_root, design_path, spec_dir):
-        self.store = RepositoryStore(repository_root)
+        self.store = repository_store(repository_root)
         self.repository_root = self.store.root_path
         self.design_relative = self.store.relative_from_supplied(design_path)
         self.design_path = self.store.display_path(self.design_relative)

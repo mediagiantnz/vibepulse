@@ -107,9 +107,27 @@ assert "ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500))" in setup_c, (
 
 guard = setup_c.split("static void guard_task(void *arg)")[1]
 starting_render = guard.find("torget_wifi_ui_set(TG_WIFI_UI_STARTING")
-slow_open = guard.find("window_open();")
+slow_open = guard.find("window_open(asked);")
 assert 0 <= starting_render < slow_open, (
     "STARTING must be rendered before scanning, APSTA and portal startup"
+)
+
+# --- Which PSK for which window ---------------------------------------------
+# The token-derived PSK is a convenience for a person holding KEY3. A window
+# the panel opened by itself can be provoked from outside (keep the station
+# off its network for 90 s), so it must carry a fresh random PSK instead.
+# The decision is the host-tested tg_wifi_ap_psk_source; window_open must
+# feed it the open reason and derive from whatever it answers.
+assert "tg_wifi_ap_psk_source(opened_by_hold, ap_token_available())" in setup_c, (
+    "window_open must ask the policy which PSK source the open reason allows"
+)
+derive = setup_c.split("static void derive_ap_password(")[1]
+derive = derive.split("static bool ap_token_available", 1)[0]
+assert "source == TG_WIFI_PSK_TOKEN_DERIVED" in derive, (
+    "the token derivation must be gated on the policy's answer"
+)
+assert "esp_random()" in derive and derive.find("#else") < derive.find("esp_random()"), (
+    "the random PSK must exist even when TG_OTA_TOKEN is defined"
 )
 
 ownership_branch = main_c.find("if (torget_wifi_setup_owns_input())")
@@ -123,9 +141,16 @@ assert "torget_wifi_setup_is_open()" not in main_c, (
     "main must not expose the STARTING gap by checking AP-open state only"
 )
 
-# The setup window may never become a firmware path.
+# The setup window may never become a firmware path. It may talk to the
+# OTA *window* (port-80 handover through torget_ota_service_maintenance_*),
+# but never to esp_ota / ota_ops, the only symbols that write a slot.
 assert "esp_ota" not in setup_c and "ota_ops" not in setup_c, (
     "the WiFi setup window must never gain a firmware-writing surface"
+)
+
+# The lwip socket budget is shared with the OTA listener's reasoning.
+assert "cfg.max_open_sockets = 3;" in setup_c, (
+    "the setup portal must cap its sockets like the OTA listener does"
 )
 
 # --- The immutable floor ----------------------------------------------------
@@ -208,18 +233,27 @@ assert "xTaskNotifyGive(s_guard_task)" in join_post, (
 
 guard = setup_c.split("static void guard_task(void *arg)")[1]
 trial_at = guard.find("s_hooks->try_credentials")
-have_ip_at = guard.find("if (!applied_now && have_ip)", trial_at)
+verdict_at = guard.find("tg_wifi_join_next_status(", trial_at)
 remember_at = guard.find("tg_wifi_creds_remember", trial_at)
 accepted_at = guard.find("s_hooks->credentials_accepted", remember_at)
-assert 0 <= trial_at < have_ip_at < remember_at < accepted_at, (
-    "the guard must trial credentials, observe IP, persist, then accept"
+assert 0 <= trial_at < verdict_at < remember_at < accepted_at, (
+    "the guard must trial credentials, ask the join policy, persist, then accept"
 )
 assert "tg_wifi_join_should_apply" in guard, (
     "the guard must apply each submission sequence at most once"
 )
 assert "bool applied_now = false" in guard
-assert "if (!applied_now && have_ip)" in guard, (
-    "an IP sample taken before a new trial starts must not validate it"
+# The host-tested policy owns the decision: an IP with the trial live in the
+# radio proves it regardless of an earlier reason code (reason 15 under
+# marginal signal used to forget a network that had just worked), an IP
+# sampled before the trial applied proves nothing, and a trial that never
+# reached the radio cannot be proven by a saved network's IP.
+assert re.search(
+    r"tg_wifi_join_next_status\(\s*join_status, trial_live, applied_now, have_ip, reason\)",
+    guard,
+), "the guard must feed the join policy the live-trial flag, applied_now, have_ip and the reason"
+assert "trial_live = s_hooks->try_credentials &&" in guard, (
+    "trial_live must be exactly whether try_credentials reached the radio"
 )
 assert "s_hooks->last_disconnect_reason" in guard, (
     "retry status must come from the radio's numeric disconnect reason"

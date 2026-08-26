@@ -1,6 +1,7 @@
 #ifndef AGENT_MONITOR_H
 #define AGENT_MONITOR_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "lvgl.h"
@@ -37,12 +38,19 @@ void tk_agent_monitor_dismiss_current(void);
 
 /* A "Needs You" verdict left the glass: the human tapped APPROVE / DENY /
  * LEAVE IT on the interactive takeover. The app layer wires this to the signed
- * network queue; until it does, a tap only dismisses the screen locally, which
- * is exactly what the simulator wants. context is a copied provider/source/
- * relay binding for the exact visible item. The callback must only queue; no
- * crypto, HTTP, or other blocking work is allowed on the LVGL task. Never
- * called for a verdict the policy would not allow. */
-typedef void (*tk_agent_monitor_needs_you_cb)(
+ * network queue. context is a copied provider/source/relay binding for the
+ * exact visible item. The callback must only queue; no crypto, HTTP, or other
+ * blocking work is allowed on the LVGL task. Never called for a verdict the
+ * policy would not allow.
+ *
+ * CONTRACT: return true only when the verdict was actually queued for
+ * delivery. The monitor marks the interaction answered and plays the ON IT
+ * beat on that word alone; false (queue full, binding refused) keeps the
+ * takeover up and shows NOT SENT, so the glass never claims an answer that
+ * stayed on the device. With no callback registered at all (no device key)
+ * the screens offer LEAVE IT only. The simulator's callback prints the
+ * canonical message and returns true. */
+typedef bool (*tk_agent_monitor_needs_you_cb)(
     tk_needs_you_verdict verdict, const tk_ir_decision_context *context);
 void tk_agent_monitor_set_needs_you_cb(tk_agent_monitor_needs_you_cb cb);
 

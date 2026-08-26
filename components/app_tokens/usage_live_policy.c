@@ -6,11 +6,11 @@
 
 #include "agent_monitor_policy.h"
 
-static bool is_effectively_active(tk_agent_state state,
-                                  uint64_t packet_age_ms) {
-  if (state == TK_AGENT_WORKING) return true;
-  return (state == TK_AGENT_WAITING || state == TK_AGENT_ERROR) &&
-         packet_age_ms <= TK_AGENT_WORKING_LEASE_MS;
+/* Freshness has already been applied by tk_agent_monitor_effective_state:
+ * an expired WORKING, WAITING or ERROR arrives here as UNKNOWN. */
+static bool is_active(tk_agent_state state) {
+  return state == TK_AGENT_WORKING || state == TK_AGENT_WAITING ||
+         state == TK_AGENT_ERROR;
 }
 
 static void build_now_context(const tk_agent_status *working,
@@ -45,7 +45,7 @@ void usage_live_build_header(const tk_agent_provider_status *provider,
   for (uint8_t i = 0; i < job_count; i++) {
     tk_agent_state state =
         tk_agent_monitor_effective_state(&provider->jobs[i], packet_age_ms);
-    if (!is_effectively_active(state, packet_age_ms)) continue;
+    if (!is_active(state)) continue;
     active_count++;
     if (state == TK_AGENT_WORKING) working = &provider->jobs[i];
   }
@@ -88,16 +88,4 @@ bool usage_live_build_today_bar(double total_pct, bool has_total,
   out->today_px = out->total_px - out->baseline_px;
   out->marker_x = out->baseline_px;
   return true;
-}
-
-usage_update_mode usage_live_choose_update(bool initialized, bool stale,
-                                           bool visible, bool has_old,
-                                           double old_pct, bool has_new,
-                                           double new_pct) {
-  if (!has_new || !isfinite(new_pct)) return USAGE_UPDATE_SILENT;
-  if (stale || !visible) return USAGE_UPDATE_SILENT;
-  if (!initialized || !has_old || !isfinite(old_pct)) return USAGE_UPDATE_DIRECT;
-  if (new_pct > old_pct) return USAGE_UPDATE_ANIMATE_FORWARD;
-  if (new_pct < old_pct) return USAGE_UPDATE_SNAP_BACKWARD;
-  return USAGE_UPDATE_DIRECT;
 }

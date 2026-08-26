@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -29,6 +30,36 @@ FONT_DIGESTS = {
         "7e6b2818edbd8f6a01ae80641cc8f16a51080d08fb4e532be3a0b6f74adb07da"
     ),
 }
+
+def _javascript_engine():
+    """JXA on macOS, Node elsewhere: both run studio.js's DOM-free core."""
+    if shutil.which("osascript"):
+        return "osascript"
+    if shutil.which("node"):
+        return "node"
+    return None
+
+
+JS_ENGINE = _javascript_engine()
+
+
+def requires_javascript(test):
+    """Skip locally without an engine; on CI a missing engine is a failure,
+    because a skipped browser-contract test is a gap nobody sees."""
+    if JS_ENGINE is not None:
+        return test
+    if os.environ.get("CI"):
+        def fail(self):
+            self.fail(
+                "browser-contract tests need a JavaScript engine on CI: "
+                "install node (or run on macOS for osascript)"
+            )
+        fail.__name__ = test.__name__
+        fail.__doc__ = test.__doc__
+        return fail
+    return unittest.skip(
+        "no JavaScript engine on PATH (osascript or node)")(test)
+
 
 EXPORT_NAMES = {
     "claude-hero",
@@ -154,7 +185,7 @@ class StudioWiringTests(unittest.TestCase):
         ):
             self.assertIn(f"hero.{hero_name}", self.js)
 
-    @unittest.skipUnless(shutil.which("osascript"), "JXA is unavailable")
+    @requires_javascript
     def test_semantic_copy_matches_firmware_for_every_data_condition(self):
         fixture = {
             "provider": "CLAUDE",
@@ -232,7 +263,7 @@ class StudioWiringTests(unittest.TestCase):
                 rf"lvglTextY\([^,]+,\s*\"{role}\"\)",
             )
 
-    @unittest.skipUnless(shutil.which("osascript"), "JXA is unavailable")
+    @requires_javascript
     def test_svg_text_coordinates_match_lvgl_raster_authority(self):
         result = self.evaluate_javascript("""
           (() => ({
@@ -255,7 +286,7 @@ class StudioWiringTests(unittest.TestCase):
             "status": 423,
         })
 
-    @unittest.skipUnless(shutil.which("osascript"), "JXA is unavailable")
+    @requires_javascript
     def test_repository_geometry_matches_browser_contract_and_stays_editable(self):
         hero = self.design["hero"]
         self.assertEqual(hero["percentY"], 150)
@@ -332,7 +363,7 @@ class StudioWiringTests(unittest.TestCase):
             save,
         )
 
-    @unittest.skipUnless(shutil.which("osascript"), "JXA is unavailable")
+    @requires_javascript
     def test_browser_contract_rejects_rendered_and_quota_overlap(self):
         rendered_overlap = {
             **self.design["hero"],
@@ -364,7 +395,7 @@ class StudioWiringTests(unittest.TestCase):
         self.assertFalse(result["renderedOverlap"])
         self.assertFalse(result["quotaOverlap"])
 
-    @unittest.skipUnless(shutil.which("osascript"), "JXA is unavailable")
+    @requires_javascript
     def test_browser_contract_locks_percent_font_to_generated_raster(self):
         hero = self.design["hero"]
         result = self.evaluate_javascript(f"""
@@ -380,7 +411,7 @@ class StudioWiringTests(unittest.TestCase):
         self.assertFalse(result["smaller"])
         self.assertFalse(result["larger"])
 
-    @unittest.skipUnless(shutil.which("osascript"), "JXA is unavailable")
+    @requires_javascript
     def test_operation_lock_covers_every_mutator_and_snapshots_export_name(self):
         prelude = """
           var __controls = [
@@ -427,7 +458,7 @@ class StudioWiringTests(unittest.TestCase):
         )
         self.assertGreaterEqual(self.js.count("if (state.operationActive)"), 3)
 
-    @unittest.skipUnless(shutil.which("osascript"), "JXA is unavailable")
+    @requires_javascript
     def test_status_halo_stays_inside_the_safe_inset(self):
         result = self.evaluate_javascript("""
           (() => {
@@ -449,13 +480,29 @@ class StudioWiringTests(unittest.TestCase):
 
     @classmethod
     def evaluate_javascript(cls, expression, prelude=""):
-        script = prelude + "\n" + cls.js + "\nJSON.stringify(" + expression + ");\n"
-        completed = subprocess.run(
-            ["osascript", "-l", "JavaScript", "-e", script],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        body = prelude + "\n" + cls.js + "\n"
+        if JS_ENGINE == "osascript":
+            script = body + "JSON.stringify(" + expression + ");\n"
+            completed = subprocess.run(
+                ["osascript", "-l", "JavaScript", "-e", script],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+        elif JS_ENGINE == "node":
+            script = (body + "process.stdout.write(JSON.stringify("
+                      + expression + "));\n")
+            completed = subprocess.run(
+                ["node", "-"],
+                input=script,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+        else:
+            raise AssertionError("no JavaScript engine is available")
         if completed.returncode != 0:
             raise AssertionError(completed.stderr.strip() or completed.stdout.strip())
         return json.loads(completed.stdout)

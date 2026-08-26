@@ -8,20 +8,14 @@
  */
 
 import { mergeTokens, newestBody } from "./merge.js";
+import {
+  jsonResponse, readNumbersBody, resolveEndpoint, textResponse,
+} from "./guard.js";
 
 export { NumbersMailbox } from "./worker.js";
 
 const ENDPOINTS = ["/api/tokens", "/api/max-tracker", "/api/github"];
-const MAX_BODY_BYTES = 64 * 1024;
 const MAX_PUBLISHERS = 8;
-
-function parsePath(url, secret) {
-  const prefix = `/u/${secret}`;
-  const path = new URL(url).pathname;
-  if (!path.startsWith(prefix + "/")) return null;
-  const endpoint = path.slice(prefix.length);
-  return ENDPOINTS.includes(endpoint) ? endpoint : null;
-}
 
 async function readDocs(env, endpoint) {
   const listed = await env.VIBEPULSE.list({ prefix: `${endpoint}:` });
@@ -42,47 +36,34 @@ export default {
   async fetch(request, env) {
     const secret = env.RELAY_SECRET;
     if (!secret || secret.length < 32)
-      return new Response("relay not configured", { status: 503 });
+      return textResponse("relay not configured", 503);
 
-    const endpoint = parsePath(request.url, secret);
-    if (endpoint === null) return new Response("not found", { status: 404 });
+    const endpoint = await resolveEndpoint(request.url, secret, ENDPOINTS);
+    if (endpoint === null) return textResponse("not found", 404);
 
     if (request.method === "POST" || request.method === "PUT") {
       const publisher =
           (request.headers.get("X-VibePulse-Publisher") || "unnamed")
               .slice(0, 64).replace(/[^A-Za-z0-9._-]/g, "_");
-      const raw = await request.text();
-      if (raw.length > MAX_BODY_BYTES)
-        return new Response("too large", { status: 413 });
-      let body;
-      try {
-        body = JSON.parse(raw);
-      } catch {
-        return new Response("not json", { status: 400 });
-      }
+      const read = await readNumbersBody(request);
+      if (read.response !== undefined) return read.response;
       const doc = JSON.stringify({
         receivedAt: Date.now() / 1000,
         publisher,
-        body,
+        body: read.document,
       });
       await env.VIBEPULSE.put(`${endpoint}:${publisher}`, doc);
-      return new Response("ok", { status: 200 });
+      return textResponse("ok", 200);
     }
 
     if (request.method === "GET") {
       const docs = await readDocs(env, endpoint);
       const merged = endpoint === "/api/tokens" ? mergeTokens(docs)
                                                 : newestBody(docs);
-      if (merged === null)
-        return new Response(JSON.stringify({ error: "no data yet" }), {
-          status: 404,
-          headers: { "Content-Type": "application/json" },
-        });
-      return new Response(JSON.stringify(merged), {
-        headers: { "Content-Type": "application/json" },
-      });
+      if (merged === null) return jsonResponse({ error: "no data yet" }, 404);
+      return jsonResponse(merged);
     }
 
-    return new Response("method not allowed", { status: 405 });
+    return textResponse("method not allowed", 405);
   },
 };

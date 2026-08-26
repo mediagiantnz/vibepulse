@@ -83,6 +83,51 @@ bool tg_wifi_join_should_apply(uint32_t submitted, uint32_t applied);
  * portalstatus. Noll betyder att radion fortfarande försöker. */
 tg_wifi_join_status tg_wifi_disconnect_status(int reason);
 
+/*
+ * The next portal status for one guard poll. The one rule that matters:
+ * an IP obtained while the trial credentials are the radio's live
+ * configuration proves the trial, whatever disconnect reason arrived
+ * earlier. Under marginal signal the radio can report reason 15
+ * (4WAY_HANDSHAKE_TIMEOUT) on a first attempt and then associate on the
+ * retry; treating that reason as final forgot a network that had just
+ * worked while the glass said WRONG PASSWORD (2026-08-26).
+ *
+ * current:     the status published so far.
+ * trial_live:  the trial reached the radio (try_credentials succeeded) and
+ *              nothing has replaced it since. A trial that never applied,
+ *              or was abandoned, cannot be proven by any IP: that IP came
+ *              from a saved network.
+ * applied_now: the trial was applied during THIS poll, so the have_ip
+ *              sample was taken before it and proves nothing yet.
+ * have_ip:     the station holds an IP right now.
+ * reason:      the radio's latest disconnect reason, 0 = still trying.
+ *
+ * IDLE and CONNECTED are terminal for this function. A reason code is only
+ * consulted while still CONNECTING; it can never demote a CONNECTED trial,
+ * and it never overrides an IP. */
+tg_wifi_join_status tg_wifi_join_next_status(tg_wifi_join_status current,
+                                             bool trial_live,
+                                             bool applied_now, bool have_ip,
+                                             int reason);
+
+/*
+ * Which PSK the setup access point uses, decided by HOW the window opened.
+ * A KEY3 hold is a person at the panel: that window may use a PSK derived
+ * from TG_OTA_TOKEN so tools/wifi-here.sh can compute it without reading
+ * the glass. A window that opened ITSELF (TG_WIFI_SETUP_AUTO_US without an
+ * IP) can be provoked from outside by anyone able to keep the station off
+ * its network (an unauthenticated deauth flood is enough), so it gets a
+ * fresh random PSK that exists only on the glass and in the QR: a long-
+ * lived secret is never handed to a window nobody at the panel asked for.
+ * Without a token every window is random. */
+typedef enum {
+  TG_WIFI_PSK_RANDOM = 0,
+  TG_WIFI_PSK_TOKEN_DERIVED,
+} tg_wifi_psk_source;
+
+tg_wifi_psk_source tg_wifi_ap_psk_source(bool opened_by_hold,
+                                         bool token_available);
+
 /* Alla synliga faser äger KEY3. STARTING slukar däremot den utlösande
  * knappens släpp i stället för att omedelbart stänga eller växla app. */
 bool tg_wifi_setup_owns_input(tg_wifi_setup_phase phase);
