@@ -142,6 +142,27 @@ HTTP_IDLE_TIMEOUT_S = 15.0
 # på en Mac.
 _IS_WINDOWS = sys.platform == "win32"
 
+# CREATE_NO_WINDOW only exists in Windows Python, so the value is spelled out
+# here: the tests patch _IS_WINDOWS to run the Windows branch on a Mac.
+_CREATE_NO_WINDOW = 0x08000000
+
+
+def _no_window_kwargs():
+    """Spawn flags that stop a child process stealing the user's focus.
+
+    The service runs under ``pythonw.exe`` on Windows, which has no console
+    of its own. Every console child therefore gets a BRAND NEW console
+    window allocated, and ``shutil.which("codex")`` resolves to the npm
+    shim ``codex.CMD``, so the spawn is really ``cmd.exe /c codex.CMD``.
+    The Codex quota poll runs on a timer, so that was a cmd window flashing
+    up and stealing keyboard focus roughly once a minute, all day, on a
+    service whose whole point is to be invisible.
+
+    CREATE_NO_WINDOW keeps the child console-less; the pipes still work
+    because stdio is redirected either way. No-op off Windows.
+    """
+    return {"creationflags": _CREATE_NO_WINDOW} if _IS_WINDOWS else {}
+
 
 def _state_dir():
     """Tjänstens tillståndskatalog — låset, cachen, historiken, spåraren.
@@ -249,6 +270,7 @@ def _read_server_rev():
             ["git", "rev-parse", "--short", "HEAD"],
             capture_output=True, text=True, timeout=5,
             cwd=os.path.dirname(os.path.abspath(__file__)),
+            **_no_window_kwargs(),
         ).stdout.strip() or "unknown"
     except Exception:
         return "unknown"
@@ -656,6 +678,7 @@ def _read_process_oauth_token():
                 "/claude.app/Contents/MacOS/claude",
             ],
             capture_output=True, text=True, timeout=5,
+            **_no_window_kwargs(),
         ).stdout
     except Exception:
         return None
@@ -668,6 +691,7 @@ def _read_process_oauth_token():
             command = subprocess.run(
                 ["ps", "eww", "-p", pid, "-o", "command="],
                 capture_output=True, text=True, timeout=5,
+                **_no_window_kwargs(),
             ).stdout.strip()
         except Exception:
             continue
@@ -686,6 +710,7 @@ def _read_keychain_oauth():
             ["security", "find-generic-password",
              "-s", "Claude Code-credentials", "-w"],
             capture_output=True, text=True, timeout=10,
+            **_no_window_kwargs(),
         ).stdout.strip()
         oauth = json.loads(raw).get("claudeAiOauth") or {}
         return oauth.get("accessToken"), oauth.get("expiresAt")
@@ -1468,7 +1493,8 @@ def _read_codex_app_server_limits(timeout_s=5):
         process = subprocess.Popen(
             command + ["app-server", "--listen", "stdio://"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, bufsize=1)
+            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            **_no_window_kwargs())
 
         def send(message):
             process.stdin.write(json.dumps(message) + "\n")

@@ -967,6 +967,74 @@ class ClaudeLimitHeaderTests(unittest.TestCase):
              tokenserver._limits_refreshing) = previous
 
 
+class SpawnWindowTests(unittest.TestCase):
+    """A background service must never flash a console window.
+
+    On Windows the service runs under pythonw.exe, which owns no console,
+    so every console child gets a new window allocated - and `codex`
+    resolves to the npm shim `codex.CMD`, making the spawn `cmd.exe /c ...`.
+    The Codex quota poll is on a timer, so this was a cmd window flashing up
+    and stealing keyboard focus about once a minute.
+    """
+
+    def _spawn_kwargs(self, is_windows):
+        seen = {}
+
+        def popen(command, **kwargs):
+            seen.update(kwargs)
+            # OSError is what the reader already treats as "no quota this
+            # cycle", so the probe unwinds cleanly and we keep the kwargs.
+            raise OSError("recorded")
+
+        with mock.patch.object(tokenserver, "_IS_WINDOWS", is_windows), \
+                mock.patch.object(tokenserver, "_codex_app_server_command",
+                                  return_value="codex"), \
+                mock.patch.object(tokenserver.subprocess, "Popen",
+                                  side_effect=popen):
+            self.assertEqual(
+                tokenserver._read_codex_app_server_limits(timeout_s=1), {})
+        return seen
+
+    def test_codex_poll_spawns_without_a_console_window(self):
+        self.assertEqual(
+            self._spawn_kwargs(True).get("creationflags"), 0x08000000)
+
+    def test_no_creationflags_are_passed_off_windows(self):
+        # CREATE_NO_WINDOW does not exist in POSIX Python; passing it would
+        # raise instead of quietly doing nothing.
+        self.assertNotIn("creationflags", self._spawn_kwargs(False))
+
+    def test_every_spawn_in_the_service_passes_the_flags(self):
+        """The guard: a new subprocess call without the flags brings the
+        flashing back, and it would only show up on someone's Windows box
+        weeks later. Fail here instead."""
+        import ast
+
+        tree = ast.parse(
+            Path(tokenserver.__file__).read_text(encoding="utf-8"))
+        missing = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Attribute)
+                    and func.attr in {"run", "Popen", "call",
+                                      "check_output", "check_call"}
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "subprocess"):
+                continue
+            if not any(keyword.arg is None
+                       and isinstance(keyword.value, ast.Call)
+                       and isinstance(keyword.value.func, ast.Name)
+                       and keyword.value.func.id == "_no_window_kwargs"
+                       for keyword in node.keywords):
+                missing.append(node.lineno)
+        self.assertEqual(
+            missing, [],
+            "subprocess spawned without **_no_window_kwargs() at lines "
+            f"{missing}")
+
+
 class CodexLimitLogTests(unittest.TestCase):
     @staticmethod
     def _event(rate_limits, timestamp="2026-08-07T10:00:00Z"):

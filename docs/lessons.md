@@ -470,3 +470,23 @@ must fit the cap. **Guards:** `test_task_names_wiring.py` pins name lengths,
 the probe's truncation and the pre-advanced first probe (~4 s); the probe
 now truncates before asking. **Watch for:** new task names, and any new
 periodic diagnostic that first fires after 8 s.
+
+## 2026-08-27 · A console-less service stole focus once a minute
+
+The Codex quota poll spawns `codex app-server` every 60 s. On Windows the
+service runs under `pythonw.exe`, which owns no console, so every console
+child gets a BRAND NEW console allocated, and `shutil.which("codex")`
+resolves to the npm shim `codex.CMD`, making the real spawn
+`cmd.exe /c codex.CMD`. The result was a cmd window flashing up and taking
+keyboard focus once a minute, all day, from a service whose whole point is
+to be invisible. It reproduced on demand: without the flag, two new visible
+windows per spawn (`CASCADIA_HOSTING_WINDOW_CLASS` titled `cmd.exe`, plus a
+`PseudoConsoleWindow`); with it, zero. **The rule:** a background process
+with no console of its own must pass `CREATE_NO_WINDOW` on every spawn -
+inheriting "no console" from the parent does the opposite of what you want.
+**Guards:** `_no_window_kwargs()` is the single source of the flags, and
+`SpawnWindowTests` walks the module's AST so a new `subprocess.*` call
+without `**_no_window_kwargs()` fails the suite instead of surfacing on
+someone's desktop weeks later. **Watch for:** `conhost.exe` in a process
+tree proving nothing - `CREATE_NO_WINDOW` still creates a console, just an
+invisible one, so verify by counting VISIBLE windows, not child processes.
