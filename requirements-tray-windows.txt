@@ -1,0 +1,6 @@
+# Optional: needed only for the Windows tray app
+# (tools/tokenserver/tray_windows.py). Pillow is already pinned in
+# requirements-dev.txt; it is repeated here so the tray can be installed on a
+# machine that only runs the service.
+pystray==0.19.5
+Pillow==12.3.0

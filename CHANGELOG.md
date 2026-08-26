@@ -5,14 +5,33 @@ on the [releases page](https://github.com/niclasvestlund-YT/vibepulse/releases).
 
 ## Unreleased
 
-A whole-project review (2026-08-26) and the fixes that came out of it. No new
-feature; one fresh-clone display bug, a batch of security hardening and a
-number of honesty fixes. Operators who deployed either relay before this
+A whole-project review (2026-08-26) and the fixes that came out of it: one
+fresh-clone display bug, a batch of security hardening and a number of
+honesty fixes. One new feature, the Windows tray icon, plus the console-flash
+fix it was built alongside. Operators who deployed either relay before this
 change should redeploy with the new config and rotate the relay secret and
 both interaction tokens (see "Changed", relays).
 
+### Added
+
+- **Ikon vid klockan på Windows (`tools/tokenserver/tray_windows.py`).** The
+  service had no presence on the machine that runs it; the tray app shows the
+  highest of the four live quota percentages next to the clock, colour-coded,
+  with every number in the tooltip and menu. It owns the server rather than
+  watching one - launching `tokenserver.py` as its child, restarting it with
+  backoff, stopping it on Quit - so `install-windows-task.ps1 -Tray` retires
+  the plain service task and the two cannot race for port 8737.
+
 ### Fixed
 
+- **A console window stole focus once a minute on Windows (2026-08-27).** The
+  Codex quota poll spawns `codex app-server` every 60 s; the service runs
+  under `pythonw.exe`, which owns no console, so every console child got a
+  new one allocated - and `codex` resolves to the npm shim `codex.CMD`,
+  making the real spawn `cmd.exe /c codex.CMD`. A cmd window flashed up and
+  took keyboard focus all day. `_no_window_kwargs()` now carries
+  `CREATE_NO_WINDOW` on every spawn in the service, and a test walks the
+  module's AST so a new one without the flags fails the suite.
 - **Boot loop from the stack probe (2026-08-27, never released).** The
   ten-second stack-high-water probe asked `xTaskGetHandle` for
   "interaction-relay", a name longer than FreeRTOS's 15-character cap, and

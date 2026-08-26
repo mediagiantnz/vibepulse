@@ -454,6 +454,43 @@ tjänsten inte annonserar mDNS där:
 Macens Bonjour-namn: `scutil --get LocalHostName` (lägg till `.local`).
 Windows LAN-IP: `ipconfig`; reservera den valda IPv4-adressen i routern.
 
+## Ikon vid klockan (Windows tray)
+
+The service is deliberately invisible - `pythonw.exe`, no console, started by
+a scheduled task. That is right for a background job and wrong for a usage
+meter: until now the only way to read the numbers on the machine itself was
+to curl the port. `tray_windows.py` puts them next to the clock.
+
+```
+pip install -r requirements-tray-windows.txt
+powershell -ExecutionPolicy Bypass -File tools\tokenserver\install-windows-task.ps1 `
+    -Tray -ServerArgs "--claude-plan","max20x","--codex-plan","pro"
+```
+
+The icon is redrawn with the **highest** of the four live percentages -
+Claude week, Claude session, Codex week, Codex session - because the number
+worth a glance is whichever one is closest to biting. It is green below 50%,
+amber below 80%, red above, and grey whenever the server cannot be read:
+grey means "we do not know", never "fine". Hovering names every number; the
+right-click menu repeats them and adds Open numbers in browser, Restart
+server, Open state folder, and Quit.
+
+The tray OWNS the server rather than watching one: it launches
+`tokenserver.py` as its child, restarts it with backoff if it dies, and stops
+it on Quit. One thing starts at logon, one thing to quit, and Restart
+restarts something real. `-Tray` therefore retires the plain
+`VibePulse tokenserver` task, and installing without `-Tray` retires the tray
+task - both at once would race for port 8737 and the loser would respawn
+forever. Anything the installer does not recognise is forwarded to the
+server, so `-ServerArgs` carries the plan flags through.
+
+Windows 11 files new tray icons under the `^` overflow by default; drag it
+onto the taskbar once to pin it beside the clock.
+
+Every spawn in both files passes `CREATE_NO_WINDOW`. Neither process owns a
+console, so a console child would allocate one and flash a window - see
+`docs/lessons.md`, 2026-08-27.
+
 ## Autostart via launchd
 
 ```
