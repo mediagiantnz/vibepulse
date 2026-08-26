@@ -487,6 +487,16 @@ server, so `-ServerArgs` carries the plan flags through.
 Windows 11 files new tray icons under the `^` overflow by default; drag it
 onto the taskbar once to pin it beside the clock.
 
+Because the tray owns the child it can also keep its output, so the Windows
+side finally has the persistent background log the scheduled task never
+had - `%LOCALAPPDATA%\VibePulse\tray.log` for the supervisor's own
+decisions (started, died with which exit code, next attempt) and
+`tray-server.log` for everything the server writes to stderr, rotated to
+`.old` past 2 MB just before a spawn, which is the only moment nothing holds
+the file. That log earned itself on the first scheduled-task run: the
+installer had passed the plan flags as one comma-joined argument, and
+`unrecognized arguments: --claude-plan,max20x` was the whole diagnosis.
+
 Every spawn in both files passes `CREATE_NO_WINDOW`. Neither process owns a
 console, so a console child would allocate one and flash a window - see
 `docs/lessons.md`, 2026-08-27.

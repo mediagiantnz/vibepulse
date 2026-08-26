@@ -25,6 +25,8 @@ supposed to make less likely, not more.
 
 import argparse
 import json
+import logging
+import logging.handlers
 import os
 import subprocess
 import sys
@@ -34,6 +36,8 @@ import urllib.error
 import urllib.request
 import webbrowser
 from pathlib import Path
+
+log = logging.getLogger("vibepulse.tray")
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:8737"
 DEFAULT_POLL_S = 20.0
@@ -252,10 +256,24 @@ class ServerSupervisor:
         self.last_error = None
 
     def _spawn_real(self, command):
+        # The child's stderr goes to the tray log rather than DEVNULL. A
+        # server that refuses to start - busy port, bad argument - would
+        # otherwise fail in complete silence behind an icon that just says
+        # "unreachable", which is the least useful thing either could do.
         return subprocess.Popen(command, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
+                                stderr=self._child_log_handle(),
                                 **_no_window_kwargs())
+
+    def _child_log_handle(self):
+        try:
+            folder = state_dir()
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / "tray-server.log"
+            rotate_if_large(path)
+            return open(path, "a", encoding="utf-8", errors="replace")
+        except OSError:
+            return subprocess.DEVNULL
 
     def is_running(self):
         with self._lock:
@@ -275,9 +293,13 @@ class ServerSupervisor:
             try:
                 self._process = self._spawn(self.command)
                 self.last_error = None
+                log.info("server startad: pid %s",
+                         getattr(self._process, "pid", "?"))
             except OSError as exc:
                 self._process = None
                 self.last_error = str(exc)
+                log.error("server startade inte: %s (kommando: %s)",
+                          exc, self.command)
                 self._penalise(now)
                 return False
             # The backoff only resets once a start has actually held; see
@@ -292,6 +314,9 @@ class ServerSupervisor:
     def note_exit(self):
         """Called when the child is found dead: schedule the next attempt."""
         with self._lock:
+            if self._process is not None:
+                log.warning("server dog (exit %s); nästa försök om %.0f s",
+                            self._process.poll(), self._backoff_s)
             self._process = None
             self._penalise(self._clock())
 
@@ -338,6 +363,53 @@ def read_status(endpoint, timeout_s=8.0, opener=None):
 # --------------------------------------------------------------------- app
 
 
+_CHILD_LOG_MAX_BYTES = 2_000_000
+
+
+def rotate_if_large(path, max_bytes=_CHILD_LOG_MAX_BYTES):
+    """Keep the child's log from growing without a ceiling.
+
+    The handle is a plain redirect, so RotatingFileHandler cannot help: the
+    server writes to the file descriptor directly. Rotation therefore happens
+    at the only moment it safely can - just before a spawn, when nothing
+    holds the file. The tail is kept in ``.old``, the same shape the service
+    uses for its own log.
+    """
+    try:
+        if path.exists() and path.stat().st_size > max_bytes:
+            backup = path.with_suffix(path.suffix + ".old")
+            backup.unlink(missing_ok=True)
+            path.rename(backup)
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def setup_logging(path=None):
+    """A small rotating log beside the service's own state.
+
+    Under pythonw there is nowhere for a traceback to go, and under Task
+    Scheduler there is no terminal to have started from. Without this, a
+    tray that comes up and quietly never starts its server looks identical
+    to one that is working - which is exactly how this file's first
+    scheduled-task run behaved.
+    """
+    if log.handlers:
+        return
+    path = Path(path) if path else state_dir() / "tray.log"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            path, maxBytes=512_000, backupCount=1, encoding="utf-8")
+    except OSError:
+        handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
+
+
 def server_command(python_exe, server_path, extra_args):
     """The command the supervisor runs. pythonw so the service stays silent."""
     return [str(python_exe), str(server_path), *extra_args]
@@ -363,6 +435,8 @@ def main(argv=None):
                         help="attach to a server that is already running "
                              "instead of starting one")
     args, server_args = parser.parse_known_args(argv)
+    setup_logging()
+    log.info("tray startar: %s", sys.executable)
 
     import pystray
 
@@ -451,4 +525,13 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except BaseException:
+        # Under pythonw a traceback has nowhere to go; without this the
+        # process just disappears from the tray with no record at all.
+        setup_logging()
+        log.exception("tray kraschade")
+        raise

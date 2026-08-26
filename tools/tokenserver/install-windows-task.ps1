@@ -85,8 +85,24 @@ if (-not $Python) { $Python = (Get-Command python.exe).Source }
 
 # The tray forwards everything it does not recognise straight to
 # tokenserver.py, so both branches build the same argument tail.
+#
+# powershell.exe -File cannot pass a real array: written as
+# -ServerArgs "--claude-plan","max20x" the whole thing arrives here as the
+# SINGLE string "--claude-plan,max20x", and the task then registers it as one
+# argument that the server rejects with "unrecognized arguments". Splitting on
+# the comma makes both invocation styles work. The cost is that a value which
+# legitimately contains a comma cannot be passed this way; nothing the server
+# accepts today does. The quotes survive that boundary as literal characters
+# too, so each piece is unquoted before it is re-quoted for the task.
+$Flat = @()
+foreach ($extra in $ServerArgs) {
+    foreach ($piece in ($extra -split ',')) {
+        $piece = $piece.Trim().Trim('"').Trim("'").Trim()
+        if ($piece -ne '') { $Flat += $piece }
+    }
+}
 $Tail = ""
-foreach ($extra in $ServerArgs) { $Tail += " `"$extra`"" }
+foreach ($extra in $Flat) { $Tail += " `"$extra`"" }
 if ($PublishUrl) {
     $Tail += " --publish `"$PublishUrl`""
     if ($PublishName) { $Tail += " --publish-name `"$PublishName`"" }
@@ -123,6 +139,10 @@ if ($Tray) {
 Write-Host "  server:  $Server"
 if ($PublishUrl) { Write-Host "  relä:    $PublishUrl" }
 Write-Host "  state:   $env:LOCALAPPDATA\VibePulse\"
-Write-Host "  logg:    ingen beständig bakgrundslogg; kör manuellt för felsökning"
+if ($Tray) {
+    Write-Host "  logg:    $env:LOCALAPPDATA\VibePulse\tray.log (och tray-server.log)"
+} else {
+    Write-Host "  logg:    ingen beständig bakgrundslogg; kör manuellt för felsökning"
+}
 Write-Host "Verifiera:  curl http://localhost:8737/  (claudeProbe ska visa ok)"
 if ($Tray) { Write-Host "            och ikonen vid klockan visar högsta kvot-%" }

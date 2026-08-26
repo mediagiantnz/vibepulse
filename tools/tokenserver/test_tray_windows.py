@@ -1,5 +1,6 @@
 import ast
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -242,6 +243,42 @@ class SupervisorTests(unittest.TestCase):
         sup = self._supervisor()
         sup.stop()  # must not raise
         self.assertFalse(sup.is_running())
+
+
+class ChildLogRotationTests(unittest.TestCase):
+    """The child's log is a raw redirect, so nothing rotates it for us."""
+
+    def test_a_small_log_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "tray-server.log"
+            path.write_text("short", encoding="utf-8")
+            self.assertFalse(tray_windows.rotate_if_large(path, max_bytes=100))
+            self.assertEqual(path.read_text(encoding="utf-8"), "short")
+
+    def test_a_large_log_keeps_its_tail_in_old(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "tray-server.log"
+            path.write_text("x" * 500, encoding="utf-8")
+            self.assertTrue(tray_windows.rotate_if_large(path, max_bytes=100))
+            self.assertFalse(path.exists())
+            self.assertEqual(
+                (Path(temp_dir) / "tray-server.log.old")
+                .read_text(encoding="utf-8"), "x" * 500)
+
+    def test_rotating_twice_replaces_the_previous_old(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "tray-server.log"
+            for text in ("first", "second"):
+                path.write_text(text * 100, encoding="utf-8")
+                tray_windows.rotate_if_large(path, max_bytes=100)
+            self.assertEqual(
+                (Path(temp_dir) / "tray-server.log.old")
+                .read_text(encoding="utf-8"), "second" * 100)
+
+    def test_a_missing_log_is_not_an_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.assertFalse(tray_windows.rotate_if_large(
+                Path(temp_dir) / "absent.log", max_bytes=1))
 
 
 class ServerCommandTests(unittest.TestCase):
