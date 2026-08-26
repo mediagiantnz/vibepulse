@@ -22,6 +22,20 @@ from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def relative_spelling(path, start):
+    """A relative spelling of ``path`` that ownership checks must reject.
+
+    ``os.path.relpath`` raises when the two live on different Windows drives
+    (GitHub's runners keep the checkout on D: and temp on C:), and the tests
+    only need *a* relative spelling, so fall back to a bare parent-relative
+    one in that case.
+    """
+    try:
+        return os.path.relpath(path, start)
+    except ValueError:
+        return os.path.join("..", Path(path).parent.name, Path(path).name)
 SCRIPTS = ROOT / ".agents/plugins/plugins/vibepulse/scripts"
 MAX_HOOK_INPUT = 64 * 1024
 # The setup script resolves every executable before it plans, so the argv
@@ -577,7 +591,12 @@ class LoopbackTests(unittest.TestCase):
                     read_timeout=0.12)
                 elapsed = time.monotonic() - started
             self.assertIsNone(result)
-            self.assertLess(elapsed, 0.25)
+            # The deadline is 0.12 s; POSIX gets ~0.13 s of slack. Windows
+            # runners on GitHub have coarser timers and slower socket
+            # teardown (0.297 s observed on windows-latest), so the bound
+            # there is looser while still proving the drip was cut short of
+            # the 0.08 s x 11 chunks (~0.9 s) it would otherwise take.
+            self.assertLess(elapsed, 0.25 if os.name == "posix" else 0.6)
 
     def test_read_timeout_and_bad_responses_return_none(self):
         loopback = load_loopback()
@@ -2344,9 +2363,9 @@ class RelaySetupTests(unittest.TestCase):
                     plugin_path=plugin.parent / "spelling" / ".." /
                     "vibepulse"),
                 "marketplace relative": plugin_listing(
-                    repo=repo, marketplace_root=os.path.relpath(repo, ROOT)),
+                    repo=repo, marketplace_root=relative_spelling(repo, ROOT)),
                 "plugin relative": plugin_listing(
-                    repo=repo, plugin_path=os.path.relpath(plugin, ROOT)),
+                    repo=repo, plugin_path=relative_spelling(plugin, ROOT)),
                 "marketplace trailing separator": plugin_listing(
                     repo=repo, marketplace_root=str(repo) + os.sep),
                 "plugin trailing separator": plugin_listing(
@@ -3528,7 +3547,7 @@ class OwnershipEvidenceTests(unittest.TestCase):
                 "final symlink": alias,
                 "parent symlink": parent_alias / "repo",
                 "dotdot": repo / "foreign" / "..",
-                "relative": os.path.relpath(repo, ROOT),
+                "relative": relative_spelling(repo, ROOT),
                 "trailing separator": str(repo) + os.sep,
                 "lookalike": base / "repo-lookalike",
             }

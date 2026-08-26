@@ -4,10 +4,12 @@
 #include <string.h>
 
 /* The model-week page's label when the service has not named the model.
- * Generic on purpose: naming a model here would be inventing which one the
- * week belongs to, and the service already sends the real label whenever
- * it knows it (claudeModelWeekLabel). */
-#define USAGE_MODEL_WEEK_FALLBACK_LABEL "MODEL \xC2\xB7 WEEK"
+ * This is the page's fixed identity, not a claim about the payload: the
+ * approved no-data landmark (test_vibepulse_visual_landmarks.py,
+ * "no-data must retain the fixed FABLE · WEEK page identity") pins it, so
+ * changing the word is an AMOLED design decision, not a presenter fix. The
+ * service sends the real label whenever it knows it (claudeModelWeekLabel). */
+#define USAGE_MODEL_WEEK_FALLBACK_LABEL "FABLE \xC2\xB7 WEEK"
 
 const char *usage_presenter_quota_status_text(int has_data, int stale,
                                               const char *live_context) {

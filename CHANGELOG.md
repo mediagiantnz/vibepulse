@@ -28,8 +28,6 @@ both interaction tokens (see "Changed", relays).
   to dismiss the takeover and play the payoff anyway. The takeover now stays
   up with "NOT SENT · ANSWER AT YOUR DESK" and only LEAVE IT; a build with no
   send channel offers LEAVE IT only.
-- **Missing model label.** A model-week window without a label read
-  "FABLE · WEEK"; it now reads "MODEL · WEEK".
 - **Max Tracker and GitHub pages go stale on their own feed** instead of
   showing LIVE forever when only their endpoint dies (OBS-09, partial: the
   agent feed's copy is still pending an AMOLED review).

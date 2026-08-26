@@ -69,10 +69,10 @@ int main(void) {
   tk_tokens missing = {0};
   usage_presenter_build_quota_page(&missing, USAGE_QUOTA_CLAUDE_MODEL,
                                    &page);
-  /* No label from the service means no model name from the panel either:
-   * "MODEL · WEEK" claims nothing about WHICH model the week belongs to. */
+  /* No label from the service: the page keeps its fixed identity (the
+   * approved no-data landmark pins "FABLE · WEEK") but paints no numbers. */
   check("missing model quota remains truthful",
-        strcmp(page.quota.label, "MODEL · WEEK") == 0 &&
+        strcmp(page.quota.label, "FABLE · WEEK") == 0 &&
         strcmp(page.quota.pct_text, "–") == 0 &&
         strcmp(page.quota.delta_text, "–") == 0 &&
         strcmp(page.quota.reset_short_text, "–") == 0 &&
@@ -83,8 +83,8 @@ int main(void) {
   unlabelled.claude_model_week_label[0] = '\0';
   usage_presenter_build_quota_page(&unlabelled, USAGE_QUOTA_CLAUDE_MODEL,
                                    &page);
-  check("percent without a label never invents a model name",
-        strcmp(page.quota.label, "MODEL · WEEK") == 0 &&
+  check("percent without a label keeps the fixed page identity",
+        strcmp(page.quota.label, "FABLE · WEEK") == 0 &&
         strcmp(page.quota.pct_text, "73%") == 0);
 
   check("fresh quota without agent context is live",
