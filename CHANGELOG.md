@@ -24,6 +24,16 @@ both interaction tokens (see "Changed", relays).
 
 ### Fixed
 
+- **The Codex plugin's hooks failed on every Windows session (2026-09-14).**
+  Codex runs hook commands through PowerShell on Windows, not `cmd.exe`, so
+  the `%PLUGIN_ROOT%` in both `commandWindows` entries was never expanded and
+  `py -3` was handed a literal `%PLUGIN_ROOT%\scripts\...` path. Codex itself
+  substitutes `${PLUGIN_ROOT}` into the command text before it runs, so the
+  hooks now use that form, which works under PowerShell and `cmd.exe` alike.
+  Note that Codex copies a local-marketplace plugin into
+  `~/.codex/plugins/cache/<marketplace>/<plugin>/<version>/` and runs the
+  copy, so a hooks.json edit only takes effect after the cache is refreshed,
+  and the changed handler needs re-trusting in Codex.
 - **A console window stole focus once a minute on Windows (2026-08-27).** The
   Codex quota poll spawns `codex app-server` every 60 s; the service runs
   under `pythonw.exe`, which owns no console, so every console child got a

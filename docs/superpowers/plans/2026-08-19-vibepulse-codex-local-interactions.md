@@ -664,7 +664,7 @@ default `hooks/hooks.json` discovery with:
       "hooks": [{
         "type": "command",
         "command": "python3 \"$PLUGIN_ROOT/scripts/session_start.py\"",
-        "commandWindows": "py -3 \"%PLUGIN_ROOT%\\scripts\\session_start.py\"",
+        "commandWindows": "py -3 \"${PLUGIN_ROOT}\\scripts\\session_start.py\"",
         "timeout": 3,
         "additionalContextLimit": 1800
       }]
@@ -674,7 +674,7 @@ default `hooks/hooks.json` discovery with:
       "hooks": [{
         "type": "command",
         "command": "python3 \"$PLUGIN_ROOT/scripts/permission_hook.py\"",
-        "commandWindows": "py -3 \"%PLUGIN_ROOT%\\scripts\\permission_hook.py\"",
+        "commandWindows": "py -3 \"${PLUGIN_ROOT}\\scripts\\permission_hook.py\"",
         "timeout": 125,
         "statusMessage": "Waiting for VibePulse or this computer"
       }]
