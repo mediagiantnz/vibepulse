@@ -96,7 +96,7 @@ for test_name in (
     assert test_name in runner
 assert "tools/interaction-relay" in runner
 assert "npm ci" in runner and "npm test" in runner and "npm run typecheck" in runner
-assert "node-version: 22" in workflow
+assert "node-version: 24" in workflow
 assert "tools/interaction-relay" in workflow
 assert "requirements-interaction-relay.txt" in workflow
 for runner in ("ubuntu-latest", "macos-latest", "windows-latest"):
