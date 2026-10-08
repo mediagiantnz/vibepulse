@@ -418,7 +418,8 @@ class GeneratedTableTest(unittest.TestCase):
 
     def test_the_models_actually_in_use_are_priced(self):
         for model in ("claude-opus-5", "claude-sonnet-5", "claude-fable-5",
-                      "claude-haiku-4-5", "gpt-5.6-sol", "gpt-5.1-codex"):
+                      "claude-haiku-4-5", "claude-opus-5-5", "claude-sonnet-5-5",
+                      "claude-haiku-5-5", "gpt-5.6-sol", "gpt-5.1-codex"):
             self.assertTrue(self.table.knows(model), model)
 
     def test_every_model_prices_both_sides_of_the_bill(self):

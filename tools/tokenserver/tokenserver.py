@@ -1162,7 +1162,7 @@ def _probe_limits_locked():
         return None
 
     body = json.dumps({
-        "model": "claude-haiku-4-5",  # billigaste proben; headrarna är desamma
+        "model": "claude-haiku-5-5",  # billigaste proben; headrarna är desamma
         "max_tokens": 0,              # prefill utan output — i praktiken gratis
         "messages": [{"role": "user", "content": "ping"}],
     }).encode()
