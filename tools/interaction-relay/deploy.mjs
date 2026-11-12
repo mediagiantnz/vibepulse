@@ -27,9 +27,17 @@ function guardError(message) {
   return new Error(`deploy guard: ${message}`);
 }
 
-function pinnedWrangler() {
-  const executable = process.platform === "win32" ? "wrangler.cmd" : "wrangler";
-  return resolve(SERVICE_DIR, "node_modules", ".bin", executable);
+// Wrangler is started as `node <wrangler.js>` rather than through the
+// node_modules/.bin shim. On Windows that shim is wrangler.cmd, and since the
+// CVE-2024-27980 fix Node refuses to spawn a .cmd without a shell (EINVAL),
+// so the guard failed with "Wrangler could not start" on every Windows run.
+// Running the script under the current node needs no shell and no quoting.
+function pinnedWrangler(args) {
+  return {
+    command: process.execPath,
+    args: [resolve(SERVICE_DIR, "node_modules", "wrangler", "bin", "wrangler.js"),
+      ...args],
+  };
 }
 
 export function committedMailboxId(configPath =
@@ -88,7 +96,8 @@ export async function runDeploy(args, { spawn = nodeSpawn } = {}) {
   if (dryRun) wranglerArgs.push("--dry-run");
   let child;
   try {
-    child = spawn(pinnedWrangler(), wranglerArgs, {
+    const wrangler = pinnedWrangler(wranglerArgs);
+    child = spawn(wrangler.command, wrangler.args, {
       cwd: SERVICE_DIR,
       stdio: "inherit",
     });

@@ -1,23 +1,23 @@
 Read `README.md` for the repository structure and build workflow.
 
 Setting this repo up for someone (secrets, build, flash, tokenserver)? Follow
-`docs/agent-setup.md` — step-by-step, with verifications and a symptom→fix
+`docs/agent-setup.md` - step-by-step, with verifications and a symptom→fix
 table. Never flash the board without the user explicitly asking you to.
 
 ## Over-the-air updates
 
 Day-to-day firmware goes over the air: `idf.py build && tools/ota-flash.sh`
 (device IP from git-ignored `.ota-device`). The full loop, consent model and
-troubleshooting live in `docs/ota.md` — read it before touching anything
+troubleshooting live in `docs/ota.md` - read it before touching anything
 OTA. Non-negotiables: the maintenance window opens ONLY from the device (a
-3 s KEY3 hold — with an IP; without one the same hold opens the WiFi setup
-window instead, see `docs/wifi.md` — or the UPDATE pill on the takeover) —
+3 s KEY3 hold - with an IP; without one the same hold opens the WiFi setup
+window instead, see `docs/wifi.md` - or the UPDATE pill on the takeover) -
 never claim or imply a
 script can; the sender gates (newest-binary-at-send, version printed,
--dirty refused) exist because a stale archived build once froze the panel —
+-dirty refused) exist because a stale archived build once froze the panel -
 never bypass them with TG_OTA_ALLOW_DIRTY without the user saying so; and
 after editing `tools/tokenserver/`, restart the launchd service
-(`launchctl kickstart -k gui/$(id -u)/se.torget.tokenserver`) — the running
+(`launchctl kickstart -k gui/$(id -u)/se.torget.tokenserver`) - the running
 process keeps old code and the panel honestly shows the gap.
 
 ## AMOLED visual work
@@ -30,7 +30,7 @@ authorization for the physical install.
 ## Logs, errors, and learning from mistakes
 
 `docs/observability.md` maps every log the system generates and contains the
-periodic comb routine — follow it when asked to comb, audit, or investigate
+periodic comb routine - follow it when asked to comb, audit, or investigate
 logs or odd behavior. Findings go to `docs/observability-backlog.md`. Read
 `docs/lessons.md` before touching pollers, parsers, staleness logic, or the
 launchd setup: most sharp edges here have a story, and fixes with a
@@ -51,19 +51,19 @@ Never copy secrets or turn an opportunity into authorized implementation work.
 
 Two rules, learned 2026-08-16, not optional:
 
-- **When an important feature ships, update `README.md` in the same effort** —
+- **When an important feature ships, update `README.md` in the same effort** -
   headline it at the top (tagline + intro) AND add/refresh its own section with
   current 480 x 480 simulator frames. A feature nobody can see in the README is
   a feature nobody adopts.
 - **Every GitHub release gets real feature images and a clean card.** Embed the
   feature's simulator frames in the release body via absolute
   `raw.githubusercontent.com/.../<tag>/...` URLs. Do NOT open the body with a
-  `# Release: ...` H1 — GitHub renders it huge and it collides with the title in
+  `# Release: ...` H1 - GitHub renders it huge and it collides with the title in
   the auto-generated OG card; lead with a plain intro paragraph instead.
-  Releases are source-only — never attach `torget.bin` (WiFi creds + device key
+  Releases are source-only - never attach `torget.bin` (WiFi creds + device key
   compiled in). The per-release OG card is auto-generated and NOT customisable;
   the one shared-link image you can set is the repo's Social preview (Settings ->
-  Social preview) — refresh it for a major feature.
+  Social preview) - refresh it for a major feature.
 - **Tagging includes the documentation cut.** In the same effort, move the
   shipped entries out of `Unreleased` into a dated version in `CHANGELOG.md`,
   leave a new empty `Unreleased` section at the top, update README's `Latest

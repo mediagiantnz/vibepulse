@@ -138,11 +138,20 @@ def headline(status):
 
     Returns ``(label, pct)``, or ``(None, None)`` when nothing is readable -
     a server that is down must not render as a confident 0%.
+
+    A stale reading (an old Codex or cached Claude week) only counts when
+    no fresh reading exists, so yesterday's high number cannot hold the
+    icon red with a confident figure while live numbers say otherwise
+    (2026-11-12 review, CLUSAGE-BUG-004). The menu and tooltip still show
+    every row, stale ones marked.
     """
+    rows = [(label, pct, stale)
+            for label, pct, _reset, stale in tracked_rows(status)
+            if pct is not None]
+    if any(not stale for _l, _p, stale in rows):
+        rows = [row for row in rows if not row[2]]
     best_label, best_pct = None, None
-    for label, pct, _reset, _stale in tracked_rows(status):
-        if pct is None:
-            continue
+    for label, pct, _stale in rows:
         if best_pct is None or pct > best_pct:
             best_label, best_pct = label, pct
     return best_label, best_pct
@@ -232,6 +241,33 @@ def render_icon(pct, healthy=True, size=64):
 
 # ------------------------------------------------------------------- server
 
+# Arguments whose value is a credential. The numbers-relay URL carries its
+# secret in the path (/u/<secret>/...), and tray.log is the file the menu
+# invites you to open and paste into a support thread.
+_SECRET_FLAGS = ("--publish",)
+
+
+def redacted_command(command):
+    """The command list with credential-bearing values replaced, for logs."""
+    out = []
+    hide_next = False
+    for arg in command:
+        arg = str(arg)
+        if hide_next:
+            out.append("<redacted>")
+            hide_next = False
+            continue
+        flag, sep, _value = arg.partition("=")
+        if flag in _SECRET_FLAGS:
+            if sep:
+                out.append(f"{flag}=<redacted>")
+            else:
+                out.append(arg)
+                hide_next = True
+            continue
+        out.append(arg)
+    return out
+
 
 class ServerSupervisor:
     """Owns the tokenserver child: start it, restart it, stop it.
@@ -267,10 +303,8 @@ class ServerSupervisor:
 
     def _child_log_handle(self):
         try:
-            folder = state_dir()
-            folder.mkdir(parents=True, exist_ok=True)
-            path = folder / "tray-server.log"
-            rotate_if_large(path)
+            path = server_log_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
             return open(path, "a", encoding="utf-8", errors="replace")
         except OSError:
             return subprocess.DEVNULL
@@ -299,7 +333,7 @@ class ServerSupervisor:
                 self._process = None
                 self.last_error = str(exc)
                 log.error("server startade inte: %s (kommando: %s)",
-                          exc, self.command)
+                          exc, redacted_command(self.command))
                 self._penalise(now)
                 return False
             # The backoff only resets once a start has actually held; see
@@ -312,11 +346,19 @@ class ServerSupervisor:
         self._backoff_s = min(self._backoff_s * 2, self.max_backoff_s)
 
     def note_exit(self):
-        """Called when the child is found dead: schedule the next attempt."""
+        """Called when the child is found dead: schedule the next attempt.
+
+        Only the alive-to-dead transition counts. The refresh loop calls
+        this on every poll while no child is running, so penalising each
+        call would push the next attempt past "now" on every poll and the
+        server would never come back (2026-11-12 review, CLUSAGE-BUG-001).
+        A failed spawn is penalised in start() instead.
+        """
         with self._lock:
-            if self._process is not None:
-                log.warning("server dog (exit %s); nästa försök om %.0f s",
-                            self._process.poll(), self._backoff_s)
+            if self._process is None:
+                return
+            log.warning("server dog (exit %s); nästa försök om %.0f s",
+                        self._process.poll(), self._backoff_s)
             self._process = None
             self._penalise(self._clock())
 
@@ -363,27 +405,18 @@ def read_status(endpoint, timeout_s=8.0, opener=None):
 # --------------------------------------------------------------------- app
 
 
-_CHILD_LOG_MAX_BYTES = 2_000_000
+def server_log_path():
+    """Where the child's stderr goes: the server's own DEFAULT_LOG_PATH.
 
-
-def rotate_if_large(path, max_bytes=_CHILD_LOG_MAX_BYTES):
-    """Keep the child's log from growing without a ceiling.
-
-    The handle is a plain redirect, so RotatingFileHandler cannot help: the
-    server writes to the file descriptor directly. Rotation therefore happens
-    at the only moment it safely can - just before a spawn, when nothing
-    holds the file. The tail is kept in ``.old``, the same shape the service
-    uses for its own log.
+    tokenserver.py already caps that file (5 MB, tail kept in ``.old``) at
+    start and then hourly, but only when its stderr IS that file - it
+    compares fstat of fd 2 with the path. Redirecting into a separate file
+    meant the server never rotated it and the tray could only rotate before
+    a spawn, so a server that stayed up for weeks grew it without a ceiling
+    (2026-11-12 review, CLUSAGE-ARCH-004). Must match
+    tokenserver._log_dir() / "torget-tokenserver.log".
     """
-    try:
-        if path.exists() and path.stat().st_size > max_bytes:
-            backup = path.with_suffix(path.suffix + ".old")
-            backup.unlink(missing_ok=True)
-            path.rename(backup)
-            return True
-    except OSError:
-        pass
-    return False
+    return state_dir() / "Logs" / "torget-tokenserver.log"
 
 
 def setup_logging(path=None):

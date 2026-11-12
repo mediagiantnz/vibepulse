@@ -1,5 +1,6 @@
 import ast
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,6 +32,16 @@ class HeadlineTests(unittest.TestCase):
 
     def test_a_dead_server_is_not_a_confident_zero(self):
         self.assertEqual(tray_windows.headline({}), (None, None))
+
+    def test_a_stale_reading_does_not_beat_a_fresh_one(self):
+        status = {"claudeWeekPct": 42.0, "codexWeekPct": 91.0,
+                  "codexWeekStale": True}
+        self.assertEqual(tray_windows.headline(status), ("Claude week", 42.0))
+
+    def test_stale_readings_still_count_when_nothing_is_fresh(self):
+        status = {"claudeWeekPct": 30.0, "claudeWeekStale": True,
+                  "codexWeekPct": 70.0, "codexWeekStale": True}
+        self.assertEqual(tray_windows.headline(status), ("Codex week", 70.0))
 
     def test_unreadable_values_are_skipped_not_coerced(self):
         status = {"claudeWeekPct": None, "claudeSessionPct": "n/a",
@@ -191,6 +202,53 @@ class SupervisorTests(unittest.TestCase):
         self.assertTrue(sup.start())
         self.assertEqual(len(self.spawned), 2)
 
+    def _refresh_once(self, sup):
+        """One pass of the real refresh loop in tray_windows.main()."""
+        if sup.is_running():
+            sup.settle()
+        else:
+            sup.note_exit()
+            sup.start()
+
+    def test_the_refresh_loop_respawns_a_dead_child(self):
+        """The loop calls note_exit() then start() on every poll while the
+        child is down, with no time passing between the two. Penalising on
+        every note_exit() pushed the next attempt past "now" each poll, so
+        the server was never restarted (CLUSAGE-BUG-001)."""
+        sup = self._supervisor()
+        sup.start()
+        self.spawned[0].die()
+        for _ in range(3):
+            self._refresh_once(sup)
+            self.now += 20.0
+        self.assertEqual(len(self.spawned), 2)
+        self.assertTrue(sup.is_running())
+
+    def test_a_child_that_keeps_dying_is_still_backed_off(self):
+        sup = self._supervisor()
+        sup.start()
+        spawn_times = [self.now]
+        for _ in range(60):
+            if self.spawned[-1].poll() is None:
+                self.spawned[-1].die()  # dies before the next poll sees it
+            before = len(self.spawned)
+            self._refresh_once(sup)
+            if len(self.spawned) > before:
+                spawn_times.append(self.now)
+            self.now += 1.0
+        gaps = [b - a for a, b in zip(spawn_times, spawn_times[1:])]
+        self.assertGreater(len(gaps), 3)
+        self.assertEqual(gaps, sorted(gaps))  # never gets faster
+        self.assertGreaterEqual(gaps[-1], 16.0)  # reached the cap
+
+    def test_note_exit_with_nothing_running_does_not_push_the_retry(self):
+        sup = self._supervisor()
+        sup._next_attempt_at = 5.0
+        sup.note_exit()
+        sup.note_exit()
+        self.assertEqual(sup._next_attempt_at, 5.0)
+        self.assertEqual(sup._backoff_s, 2.0)
+
     def test_a_server_that_cannot_start_backs_off_instead_of_spinning(self):
         """A busy port would otherwise respawn in a tight loop for as long as
         the user stays logged in."""
@@ -205,6 +263,30 @@ class SupervisorTests(unittest.TestCase):
             self.now = sup._next_attempt_at
         self.assertEqual(delays, [2.0, 4.0, 8.0, 16.0, 16.0])
         self.assertIn("port busy", sup.last_error)
+
+    def test_a_failed_spawn_never_logs_the_relay_secret(self):
+        """The relay URL is the credential, and tray.log is the file the
+        menu invites you to open and share (CLUSAGE-SEC-003)."""
+        def refuse(_command):
+            raise OSError("port busy")
+
+        secret = "https://relay.example/u/s3cr3t-token"
+        self.now = 0.0
+        sup = tray_windows.ServerSupervisor(
+            ["pythonw", "tokenserver.py", "--publish", secret,
+             "--publish-name", "pc"],
+            spawn=refuse, clock=lambda: self.now)
+        with self.assertLogs("vibepulse.tray", level="ERROR") as logs:
+            sup.start()
+        text = "\n".join(logs.output)
+        self.assertNotIn("s3cr3t", text)
+        self.assertIn("<redacted>", text)
+        self.assertIn("--publish-name", text)
+
+    def test_redaction_handles_the_equals_form(self):
+        self.assertEqual(
+            tray_windows.redacted_command(["a", "--publish=https://x/u/s"]),
+            ["a", "--publish=<redacted>"])
 
     def test_backoff_only_clears_once_a_start_has_held(self):
         sup = self._supervisor()
@@ -245,40 +327,29 @@ class SupervisorTests(unittest.TestCase):
         self.assertFalse(sup.is_running())
 
 
-class ChildLogRotationTests(unittest.TestCase):
-    """The child's log is a raw redirect, so nothing rotates it for us."""
+class ChildLogTests(unittest.TestCase):
+    """The child writes into the server's own log, which it rotates itself."""
 
-    def test_a_small_log_is_left_alone(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "tray-server.log"
-            path.write_text("short", encoding="utf-8")
-            self.assertFalse(tray_windows.rotate_if_large(path, max_bytes=100))
-            self.assertEqual(path.read_text(encoding="utf-8"), "short")
+    @unittest.skipUnless(sys.platform == "win32", "tray is Windows-only")
+    def test_child_log_is_the_servers_own_rotating_log(self):
+        """tokenserver only rotates DEFAULT_LOG_PATH when its stderr IS that
+        file, so any other path would grow without a ceiling."""
+        from tools.tokenserver import tokenserver
+        self.assertEqual(tray_windows.server_log_path(),
+                         tokenserver.DEFAULT_LOG_PATH)
 
-    def test_a_large_log_keeps_its_tail_in_old(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "tray-server.log"
-            path.write_text("x" * 500, encoding="utf-8")
-            self.assertTrue(tray_windows.rotate_if_large(path, max_bytes=100))
-            self.assertFalse(path.exists())
-            self.assertEqual(
-                (Path(temp_dir) / "tray-server.log.old")
-                .read_text(encoding="utf-8"), "x" * 500)
-
-    def test_rotating_twice_replaces_the_previous_old(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "tray-server.log"
-            for text in ("first", "second"):
-                path.write_text(text * 100, encoding="utf-8")
-                tray_windows.rotate_if_large(path, max_bytes=100)
-            self.assertEqual(
-                (Path(temp_dir) / "tray-server.log.old")
-                .read_text(encoding="utf-8"), "second" * 100)
-
-    def test_a_missing_log_is_not_an_error(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            self.assertFalse(tray_windows.rotate_if_large(
-                Path(temp_dir) / "absent.log", max_bytes=1))
+    def test_child_log_is_opened_for_append_in_a_created_folder(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                mock.patch.object(tray_windows, "state_dir",
+                                  return_value=Path(temp_dir)):
+            handle = tray_windows.ServerSupervisor(["x"])._child_log_handle()
+            try:
+                self.assertEqual(handle.mode, "a")
+                self.assertEqual(Path(handle.name),
+                                 Path(temp_dir) / "Logs"
+                                 / "torget-tokenserver.log")
+            finally:
+                handle.close()
 
 
 class ServerCommandTests(unittest.TestCase):

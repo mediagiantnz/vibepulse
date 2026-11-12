@@ -15,6 +15,15 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 
 const RELAY_DIR = dirname(fileURLToPath(import.meta.url));
+const WRANGLER_JS = resolve(RELAY_DIR, "node_modules", "wrangler", "bin",
+                            "wrangler.js");
+
+// Every spawn runs `node <wrangler.js> ...`; strip the script so assertions
+// read as Wrangler's own arguments.
+function assertPinnedWrangler(call) {
+  assert.equal(call.command, process.execPath);
+  assert.equal(call.args[0], WRANGLER_JS);
+}
 const REPOSITORY_ROOT = resolve(RELAY_DIR, "..", "..");
 const REAL_KV_ID = "a".repeat(32);
 const ZERO_KV_ID = "0".repeat(32);
@@ -282,13 +291,15 @@ test("valid private configs invoke pinned Wrangler with private canonical snapsh
   const calls = [];
   let originalPath;
   const dependencies = {
-    spawn(command, args, spawnOptions) {
+    spawn(command, fullArgs, spawnOptions) {
+      const args = fullArgs.slice(1);
       const snapshotPath = args[args.indexOf("--config") + 1];
       writeFileSync(originalPath, JSON.stringify({ hijacked: true }), "utf8");
       const snapshotBytes = readFileSync(snapshotPath, "utf8");
       const snapshotMode = statSync(snapshotPath).mode & 0o777;
       calls.push({
-        command, args, spawnOptions, snapshotPath, snapshotBytes, snapshotMode,
+        command, args, fullArgs, spawnOptions, snapshotPath, snapshotBytes,
+        snapshotMode,
       });
       return fakeChild();
     },
@@ -317,7 +328,7 @@ test("valid private configs invoke pinned Wrangler with private canonical snapsh
   await runProductionDeployment(options(reorderedPath), dependencies);
 
   assert.equal(calls.length, 3);
-  assert.match(calls[0].command, /node_modules[/\\]\.bin[/\\]wrangler/);
+  assertPinnedWrangler({ command: calls[0].command, args: calls[0].fullArgs });
   assert.deepEqual(calls[0].args.filter((arg) => arg !== calls[0].snapshotPath), [
     "deploy", resolve(RELAY_DIR, "bootstrap.js"),
     "--config", "--strict", "--keep-vars", "--dry-run",
@@ -527,8 +538,8 @@ test("CI dry build compiles both staged entrypoints without a deploy mode",
   const { runCiDryBuild } = await import("./deploy.mjs");
   const calls = [];
   await runCiDryBuild({
-    spawn(command, args) {
-      calls.push({ command, args });
+    spawn(command, fullArgs) {
+      calls.push({ command, fullArgs, args: fullArgs.slice(1) });
       return fakeChild();
     },
   });
@@ -541,7 +552,7 @@ test("CI dry build compiles both staged entrypoints without a deploy mode",
       "--strict", "--keep-vars", "--dry-run"],
   ]);
   for (const call of calls) {
-    assert.match(call.command, /node_modules[/\\]\.bin[/\\]wrangler/);
+    assertPinnedWrangler({ command: call.command, args: call.fullArgs });
     assert.ok(call.args.includes("--dry-run"));
   }
 });

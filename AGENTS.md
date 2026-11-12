@@ -1,4 +1,4 @@
-# VibePulse — firmware för hyllskärmen
+# VibePulse - firmware för hyllskärmen
 
 **Setting this repo up for someone? Follow
 [docs/agent-setup.md](docs/agent-setup.md), not this file.** It is in
@@ -9,14 +9,14 @@ platform, and it is mostly Swedish.
 Det här repot är **VibePulse**: appen som visar Claude Code- och
 Codex-kvoter på en Waveshare ESP32-S3-Touch-AMOLED-2.16 (480×480). Appen kör
 på **Torget**, en liten LVGL-appplattform som bor i samma repo och äger
-panelen, WiFi, ljuset och launchern — därav alla `torget_*`-namn i koden och
+panelen, WiFi, ljuset och launchern - därav alla `torget_*`-namn i koden och
 `torget.bin` som byggresultat. En skärm = en binär = ett bygge här.
 MIT-licens.
 
 **En färsk klon utifrån bygger EN app: VibePulse.** Det är hela innehållet.
 Ser du referenser till Solelkollen eller Vibbe/Buddy i den här filen är det
 underhållarens egna sidoprojekt, som bor i egna repon och bara byggs in om
-de råkar finnas utcheckade — se `## Status`. Du behöver dem inte, och deras
+de råkar finnas utcheckade - se `## Status`. Du behöver dem inte, och deras
 frånvaro är det normala.
 
 Struktur, byggkommandon och hur man skriver en app: **README.md**.
@@ -41,7 +41,7 @@ default-off. Appen ligger först i registret, så en färsk klon utifrån bygger
 en binär som startar i VibePulse och ingenting annat.
 
 Solelkollen och Vibbe/Buddy är egna produkter i egna repon och dras in som
-companion-inputs när de finns utcheckade — `TORGET_SOLELKOLLEN_DIR`
+companion-inputs när de finns utcheckade - `TORGET_SOLELKOLLEN_DIR`
 (default `~/Solelkollen/components`) respektive `TORGET_BUDDY_DIR` (default
 `~/Buddy/components`). Byggena sätter `TORGET_HAVE_SOLELKOLLEN` /
 `TORGET_HAVE_BUDDY` och registerposterna i main/registry.c är grindade på
@@ -66,11 +66,11 @@ AMOLED-skillen och mäts på panelen.
   kärnkomponenterna delas byte-identiskt mellan sim och target. UI-beteende
   hör hemma i appen/platform/, aldrig i main/main.c eller sim/main.c.
 - **Kontraktet är heligt.** Bryts torget_app.h eller torget.h bumpas
-  TORGET_APP_API_VERSION — launchern hoppar över appar med fel version.
+  TORGET_APP_API_VERSION - launchern hoppar över appar med fel version.
 - **Biblioteksregeln:** skörda vid ANDRA användningen, bygg aldrig i förväg
   (torget_fmt, torget_ticker, torget_net skördades när VibePulse, då kallad
-  Tokenmätaren, blev andra användaren — det är mallen).
-- **Ärlighetsinvarianten:** aldrig påhittade nollor — utan data visas
+  Tokenmätaren, blev andra användaren - det är mallen).
+- **Ärlighetsinvarianten:** aldrig påhittade nollor - utan data visas
   streck; räknare backar aldrig; copyn säger vad siffran faktiskt mäter.
 
 ## Releaser och utåtriktad dokumentation
@@ -97,7 +97,7 @@ authorization for the physical install.
 
 `docs/observability.md` maps every log the system generates (device serial,
 tokenserver stdout/launchd file, `GET /` diagnostics, state files, the screen
-itself) and contains the periodic comb routine — follow it when asked to
+itself) and contains the periodic comb routine - follow it when asked to
 comb, audit, or investigate logs or odd behavior. Findings go to
 `docs/observability-backlog.md`. Read `docs/lessons.md` before touching
 pollers, parsers, staleness logic, or the launchd setup; fixes with a
@@ -105,13 +105,13 @@ root-cause story add an entry there.
 
 ## Hårdvarufällorna i kortform (detaljer i spec/hardware.md)
 
-- `bsp_display_lock()` LJUGER (esp_err_t genom bool, spegelvänt) — använd
+- `bsp_display_lock()` LJUGER (esp_err_t genom bool, spegelvänt) - använd
   `esp_lv_adapter_lock(-1)` direkt (plattformens torget_ui_lock gör rätt),
   annars heapkorruption och eviga loopar.
-- LVGL 9.5: `lv_span_set_text` ritar INTE om — explicit `lv_spangroup_refresh`.
+- LVGL 9.5: `lv_span_set_text` ritar INTE om - explicit `lv_spangroup_refresh`.
 - För IMU-adress och fysisk verifiering gäller capability
   `sensors.imu-qmi8658`; komponentens header deklarerar `read_accel_mg`, som
-  saknas i källan — använd `read_accel`.
+  saknas i källan - använd `read_accel`.
 - Rotationskalibrering: SG_QUAD_UP 1, SG_QUAD_DIR -1, trösklar med
   iterationshistorik i rotation.c. Kalibrera fysisk hårdvara med ETT
   strukturerat flerlägestest, aldrig fotoforensik; en konstant per iteration.
@@ -129,8 +129,8 @@ firmware-enabled genom det build-inputet; exakt revision och evidens finns i
 `spec/hardware-sources.yaml`. Fysisk mikrofon-/högtalarfunktion är fortfarande
 overifierad.
 
-- Responsiv layout för andra Waveshare-storlekar — trigger: andra skärmtypen.
-- Butiks-/paketmaskineri och appar i egna repon via Espressifs registry —
+- Responsiv layout för andra Waveshare-storlekar - trigger: andra skärmtypen.
+- Butiks-/paketmaskineri och appar i egna repon via Espressifs registry -
   trigger: bevisad traktion efter open source.
 - Röststyrning för befintliga Vibbe/Buddy är kandidat/senare tills privacy-UI,
   fysisk mikrofon-/högtalarverifiering samt full-duplex-, audio- och

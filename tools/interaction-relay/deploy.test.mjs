@@ -63,14 +63,21 @@ test("missing, repeated, or unknown flags are usage errors", () => {
 
 test("a real mailbox id deploys through pinned Wrangler with --var", async () => {
   const calls = [];
-  const spawn = (command, args, options) => {
-    calls.push({ command, args, options });
+  const spawn = (command, fullArgs, options) => {
+    calls.push({ command, fullArgs, args: fullArgs.slice(1), options });
     return fakeChild();
   };
   await runDeploy(["--mailbox-id", REAL_MAILBOX_ID], { spawn });
   await runDeploy(["--mailbox-id", REAL_MAILBOX_ID, "--dry-run"], { spawn });
   assert.equal(calls.length, 2);
-  assert.match(calls[0].command, /node_modules[/\\]\.bin[/\\]wrangler/);
+  for (const call of calls) {
+    // `node <wrangler.js>`, never the .bin/wrangler.cmd shim Node cannot
+    // spawn on Windows without a shell (CLUSAGE-BUG-002).
+    assert.equal(call.command, process.execPath);
+    assert.equal(call.fullArgs[0],
+                 join(SERVICE_DIR, "node_modules", "wrangler", "bin",
+                      "wrangler.js"));
+  }
   assert.deepEqual(calls[0].args,
                    ["deploy", "--var", `MAILBOX_ID:${REAL_MAILBOX_ID}`]);
   assert.deepEqual(calls[1].args,

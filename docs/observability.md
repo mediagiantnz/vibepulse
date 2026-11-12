@@ -30,7 +30,7 @@ backlog IDs in parentheses track closing them.
 | 4 | Server state files | `~/Library/Application Support/VibePulse/` | durable (8 d / 400 d retention) |
 | 5 | The screen itself | dashes, `STALE`, `NO DATA` | live only |
 | 6 | CI logs | GitHub Actions | per-run |
-| 7 | Windows tray logs | `%LOCALAPPDATA%\VibePulse\tray.log` and `tray-server.log` | durable; `.old` past 2 MB |
+| 7 | Windows tray logs | `%LOCALAPPDATA%\VibePulse\tray.log` and `Logs\torget-tokenserver.log` | durable; tray.log rotates past 512 KB, the server log self-rotates at ~5 MB |
 
 Fastest health check: the **smoke test** automates comb steps 1–4 in one
 command — `python3 tools/tokenserver/smoke.py` (exit 0 ok / 1 warnings /
@@ -144,20 +144,22 @@ supervisor owns the child, so it keeps the output:
 | File | Written by | Talks about |
 |------|-----------|-------------|
 | `tray.log` | the tray | tray start, `server startad: pid N`, `server dog (exit N)`, next-attempt backoff, and any crash traceback |
-| `tray-server.log` | the server's stderr | exactly what section 2 describes, verbatim |
+| `Logs\torget-tokenserver.log` | the server's stderr | exactly what section 2 describes, verbatim |
 
-Both live in `%LOCALAPPDATA%\VibePulse\`. `tray.log` rotates through
-`logging.handlers.RotatingFileHandler`; `tray-server.log` is a raw
-redirect, so nothing rotates it for us and the tray does it itself at
-2 MB immediately before a spawn - the only moment nothing holds the
-file, tail kept in `.old`.
+Both live under `%LOCALAPPDATA%\VibePulse\`. `tray.log` rotates through
+`logging.handlers.RotatingFileHandler`. The server log is the server's own
+`DEFAULT_LOG_PATH`, so the server rotates it itself at start and hourly
+(5 MB cap, tail kept in `.old`), exactly as under launchd. Until 2026-11-12
+the tray wrote to a separate `tray-server.log` that the server never
+recognised as its own, so it only rotated when the tray respawned the
+server; an old `tray-server.log` left in the folder is safe to delete.
 
 Read `tray.log` FIRST whenever the Windows icon shows grey. A grey icon
 means the server could not be read, and the two causes look identical
 from the outside: a server that never started, and a server that started
 and died. Only this log separates them, with the exit code. Its first
 run in anger did exactly that - the installer had registered the plan
-flags as one comma-joined argument, and `tray-server.log` held the whole
+flags as one comma-joined argument, and the server log held the whole
 diagnosis: `unrecognized arguments: --claude-plan,max20x`.
 
 ### 3. `GET /` — the richest diagnostic surface

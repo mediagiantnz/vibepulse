@@ -274,11 +274,12 @@ Data kommer från två oberoende kanaler i `tools/tokenserver/max_tracker.py`
 (`MaxTrackerStore`):
 
 - **Backfill**: en bakgrundstråd kör `backfill_step()` var 0,5:e sekund
-  (samma kadens som agentstatusens poll), obundet i tiden — den fortsätter
-  ticka för evigt istället för att stänga av sig efter att ha hunnit ikapp,
-  eftersom ett tomt steg bara läser filsystemets stat-info och därför är
-  billigt nog att köra hur ofta som helst; det gör att en helt ny rollout-
-  eller sessionsfil upptäcks automatiskt utan omstart. Codex-kvoten
+  så länge det finns något att tömma, och var 30:e sekund när den har hunnit
+  ikapp. Den stänger aldrig av sig, så en helt ny rollout- eller sessionsfil
+  upptäcks automatiskt utan omstart. Ett tomt steg är inte gratis: det
+  globbar och stat:ar varje loggfil, vilket med några tusen Claude-loggar
+  höll servern på ungefär en tredjedels CPU-kärna när det kördes var 0,5:e
+  sekund. Codex-kvoten
   rekonstrueras ur `~/.codex/sessions/**/rollout-*.jsonl`; Claude-kvoten är
   inte rekonstruerbar i efterhand, så historiska Claude-dagar får bara
   aktivitet och volymnivå, aldrig procent.
@@ -491,9 +492,10 @@ Because the tray owns the child it can also keep its output, so the Windows
 side finally has the persistent background log the scheduled task never
 had - `%LOCALAPPDATA%\VibePulse\tray.log` for the supervisor's own
 decisions (started, died with which exit code, next attempt) and
-`tray-server.log` for everything the server writes to stderr, rotated to
-`.old` past 2 MB just before a spawn, which is the only moment nothing holds
-the file. That log earned itself on the first scheduled-task run: the
+`%LOCALAPPDATA%\VibePulse\Logs\torget-tokenserver.log` for everything the
+server writes to stderr. That is the server's own log path, so the server
+rotates it itself (5 MB cap, tail in `.old`), at start and hourly. That log
+earned itself on the first scheduled-task run: the
 installer had passed the plan flags as one comma-joined argument, and
 `unrecognized arguments: --claude-plan,max20x` was the whole diagnosis.
 

@@ -33,9 +33,17 @@ function isWithinRepository(path) {
   return child === "" || (!child.startsWith("..") && !isAbsolute(child));
 }
 
-function pinnedWrangler() {
-  const executable = process.platform === "win32" ? "wrangler.cmd" : "wrangler";
-  return resolve(RELAY_DIR, "node_modules", ".bin", executable);
+// Wrangler is started as `node <wrangler.js>` rather than through the
+// node_modules/.bin shim. On Windows that shim is wrangler.cmd, and since the
+// CVE-2024-27980 fix Node refuses to spawn a .cmd without a shell (EINVAL),
+// so the guard failed with "Wrangler could not start" on every Windows run.
+// Running the script under the current node needs no shell and no quoting.
+function pinnedWrangler(args) {
+  return {
+    command: process.execPath,
+    args: [resolve(RELAY_DIR, "node_modules", "wrangler", "bin", "wrangler.js"),
+      ...args],
+  };
 }
 
 function hasExactKeys(value, expectedKeys) {
@@ -128,7 +136,8 @@ async function invokeWrangler(args, dependencies = {}, signalRelay) {
   } = dependencies;
   let child;
   try {
-    child = spawn(pinnedWrangler(), args, {
+    const wrangler = pinnedWrangler(args);
+    child = spawn(wrangler.command, wrangler.args, {
       cwd: RELAY_DIR,
       stdio: "inherit",
     });

@@ -301,6 +301,12 @@ _SERVER_REV = _read_server_rev()
 _SERVER_SRC = _read_source_fingerprint()
 _SERVER_STARTED = datetime.now().astimezone().isoformat(timespec="seconds")
 MAX_TRACKER_BACKFILL_TICK_S = 0.5  # samma kadens som agent_status.POLL_S
+# Once backfill has caught up, an idle step still globs and stats every
+# Claude and Codex log (thousands of files, ~0.25 s a pass on a busy
+# machine). Running that every 0.5 s cost about a third of a CPU core
+# around the clock, so an idle loop waits this long before looking again.
+# The heatmap is per day, so a new file showing up 30 s later loses nothing.
+MAX_TRACKER_BACKFILL_IDLE_TICK_S = 30.0
 # Claude bär aldrig fönstrets minuttal i klartext (bara namnen "5h"/"7d") --
 # till skillnad från Codex, vars rate-limits-snapshot har window_minutes
 # rakt i JSON:en (se _codex_window nedan). Dessa två är plan-kontraktets
@@ -488,6 +494,12 @@ def _parse_file(path: Path, month_start: datetime, start_offset=0):
                     parsed_until = line_start
                     break
                 parsed_until = f.tell()
+                # Most transcript rows (tool results, user turns, progress)
+                # carry no usage block, and decoding them all dominated the
+                # first scan after a restart while _cache_lock was held. A
+                # row without the literal key can never yield a record.
+                if b'"usage"' not in raw_line:
+                    continue
                 try:
                     entry = json.loads(raw_line)
                 except (json.JSONDecodeError, UnicodeDecodeError):
@@ -1286,7 +1298,11 @@ def get_limits():
 # som låtsas vara färska.
 
 CODEX_SESSIONS = Path(os.path.expanduser("~/.codex/sessions"))
-CODEX_LIMITS_EVERY_S = 30
+# Each read spawns `codex app-server` (on Windows via the npm shim: cmd.exe,
+# then node, then codex.exe). Every 30 s that was ~2,900 launches a day for a
+# weekly quota that moves slowly; 3 minutes stays well inside
+# CODEX_ROLLOUT_FRESH_S below (2026-11-12 review, CLUSAGE-PERF-003).
+CODEX_LIMITS_EVERY_S = 180
 CODEX_LIMIT_SCAN_BYTES = 1024 * 1024
 CODEX_WEEK_MINUTES = 10080
 # The rollout-log fallback republishes whatever Codex last wrote. The
@@ -1429,8 +1445,30 @@ def _parse_codex_rate_limits_response(body, observed_at, now_ts):
     return out
 
 
+def _which_not_in_cwd(name):
+    """shutil.which, minus the Windows habit of searching the working
+    directory before PATH.
+
+    Without NoDefaultCurrentDirectoryInExePath in the environment (a
+    scheduled task does not have it), CPython on Windows returns
+    ``.\\codex.CMD`` from the working directory ahead of the real CLI on
+    PATH. The scheduled task runs with the repo as its working directory,
+    so a stray codex.cmd at the repo root would run under the user's
+    account every Codex poll (2026-11-12 review, CLUSAGE-SEC-004). Setting
+    the variable is process-wide and only ever narrows lookups.
+    """
+    if _IS_WINDOWS:
+        os.environ.setdefault("NoDefaultCurrentDirectoryInExePath", "1")
+    found = shutil.which(name)
+    if not found:
+        return None
+    if _IS_WINDOWS and not os.path.isabs(found):
+        return None  # still relative: it came from the cwd, not PATH
+    return found
+
+
 def _codex_app_server_command():
-    executable = shutil.which("codex")
+    executable = _which_not_in_cwd("codex")
     if executable:
         return executable
     for candidate in (
@@ -3236,24 +3274,29 @@ def _configure_interaction_relay(config, secret, *, environ=None,
 
 
 def _run_max_tracker_backfill(store, stop_event):
-    """Drain MaxTrackerStore.backfill_step() on the same 0.5 s cadence as
-    agent_status.POLL_S, forever -- never permanently stopping.
+    """Drain MaxTrackerStore.backfill_step() forever -- never permanently
+    stopping, so newly-appeared rollout/session files are discovered
+    without a restart.
 
-    Design choice, made explicit per Task 6: backfill_step()'s idle path
-    (both roots fully drained) only globs each root and stats already-known
-    files -- see MaxTrackerStore._advance_one_file, which returns without
-    opening anything once every discovered inode is marked done. That is
-    cheap enough to call every tick indefinitely, so this loop never
-    switches itself off; it just keeps discovering newly-appeared rollout/
-    session files on its own, without needing a restart.
+    While there is work to drain it ticks every MAX_TRACKER_BACKFILL_TICK_S
+    (0.5 s, the agent_status.POLL_S cadence). Once a step reports nothing
+    left, it waits MAX_TRACKER_BACKFILL_IDLE_TICK_S before trying again.
+    The idle step is not free: it globs both log trees and stats every
+    file, which on a machine with a few thousand Claude logs is a quarter
+    of a second of CPU. Doing that every 0.5 s kept the server at roughly
+    a third of a core even with nothing to do.
     """
     while not stop_event.is_set():
+        more = False
         try:
-            if store.backfill_step():
+            more = store.backfill_step()
+            if more:
                 _mark_max_tracker_dirty(store)
         except Exception:
             pass
-        if stop_event.wait(MAX_TRACKER_BACKFILL_TICK_S):
+        tick = (MAX_TRACKER_BACKFILL_TICK_S if more
+                else MAX_TRACKER_BACKFILL_IDLE_TICK_S)
+        if stop_event.wait(tick):
             break
 
 

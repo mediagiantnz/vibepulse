@@ -33,8 +33,12 @@ Designval, i linje med resten av repot:
   not interaction-provider choices.
 - Ingen hemlighet i den registrerade kommandoraden utom relä-URL:en, som
   användaren själv valt att ge — samma exponeringsnivå som secrets.h.
-- Starta om vid fel, var 5:e minut, utan tak — en hyllservice ska resa
-  sig själv, precis som launchd-plisten gör på macOS.
+- Starta om vid fel, var 5:e minut, 255 gånger (Task Scheduler lagrar
+  RestartCount som en byte, så 255 är det verkliga taket) - en hyllservice
+  ska resa sig själv, precis som launchd-plisten gör på macOS.
+- Med -Tray hamnar serverns stderr i
+  %LOCALAPPDATA%\VibePulse\Logs\torget-tokenserver.log, som servern själv
+  roterar vid 5 MB.
 #>
 param(
     [string]$PublishUrl = "",
@@ -54,6 +58,9 @@ $TrayTaskName = "VibePulse tray"
 # would restart forever. Registering either one therefore retires the other.
 function Remove-TaskIfPresent($Name) {
     if (Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue) {
+        # Unregistering does not stop a running instance; stop it first so
+        # the task registered next is not left fighting it for port 8737.
+        Stop-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
         Unregister-ScheduledTask -TaskName $Name -Confirm:$false
         Write-Host "  retired task '$Name'"
         return $true
@@ -82,6 +89,23 @@ if ($Tray -and -not (Test-Path $TrayApp)) { throw "hittar inte $TrayApp" }
 # saknas (minimala installationer) — då syns ett fönster, men tjänsten kör.
 $Python = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source
 if (-not $Python) { $Python = (Get-Command python.exe).Source }
+
+# Check the tray's packages import under the SAME interpreter the task will
+# run, before anything is retired. pip may have installed them into a
+# different Python than the first pythonw on PATH, and the failure is
+# otherwise silent: the old task is gone, the tray dies on `import pystray`,
+# no server starts, and the only trace is a line in tray.log.
+if ($Tray) {
+    $ConsolePython = Join-Path (Split-Path $Python) "python.exe"
+    if (-not (Test-Path $ConsolePython)) { $ConsolePython = $Python }
+    & $ConsolePython -c "import pystray, PIL" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        $Req = Join-Path $RepoRoot "tools\tokenserver\requirements-tray-windows.txt"
+        throw ("pystray/Pillow importerar inte under $Python. Installera dem " +
+               "i just den Python-installationen och kör igen:`n" +
+               "  & `"$ConsolePython`" -m pip install -r `"$Req`"")
+    }
+}
 
 # The tray forwards everything it does not recognise straight to
 # tokenserver.py, so both branches build the same argument tail.
@@ -119,12 +143,30 @@ if ($Tray) {
 }
 $Arguments = "`"$Entry`"" + $Tail
 
+# Stopping the old task does not always take its child with it (the tray's
+# server is a separate process, and a server started by hand is not a task
+# at all). Whatever still listens on 8737 would make the new task's server
+# fail to bind, while the tray kept showing the orphan's numbers.
+$Orphans = Get-NetTCPConnection -LocalPort 8737 -State Listen -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty OwningProcess -Unique
+foreach ($OrphanPid in $Orphans) {
+    Write-Host "  stoppar process $OrphanPid som lyssnar på 8737"
+    Stop-Process -Id $OrphanPid -Force -ErrorAction SilentlyContinue
+}
+
+# The working directory is the state folder, not the repo: the service
+# resolves its own files from __file__, and a repo-root cwd is where Windows
+# would look first for a bare `codex` (see tokenserver._which_not_in_cwd).
+$WorkDir = Join-Path $env:LOCALAPPDATA "VibePulse"
+New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+
 $Action = New-ScheduledTaskAction -Execute $Python -Argument $Arguments `
-    -WorkingDirectory $RepoRoot
+    -WorkingDirectory $WorkDir
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+# RestartCount is stored as an unsigned byte; 255 is the real maximum.
 $Settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-    -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 5) `
+    -RestartCount 255 -RestartInterval (New-TimeSpan -Minutes 5) `
     -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
 
 Register-ScheduledTask -TaskName $RegisterAs -Action $Action `
@@ -134,13 +176,14 @@ Start-ScheduledTask -TaskName $RegisterAs
 Write-Host "Uppgiften '$RegisterAs' registrerad och startad."
 if ($Tray) {
     Write-Host "  tray:    $TrayApp  (launches and supervises the server)"
-    Write-Host "  deps:    pip install -r requirements-tray-windows.txt"
 }
 Write-Host "  server:  $Server"
-if ($PublishUrl) { Write-Host "  relä:    $PublishUrl" }
+# Host only: the path of the relay URL is its secret.
+if ($PublishUrl) { Write-Host "  relä:    $(([uri]$PublishUrl).Host)" }
 Write-Host "  state:   $env:LOCALAPPDATA\VibePulse\"
 if ($Tray) {
-    Write-Host "  logg:    $env:LOCALAPPDATA\VibePulse\tray.log (och tray-server.log)"
+    Write-Host "  logg:    $env:LOCALAPPDATA\VibePulse\tray.log"
+    Write-Host "           $env:LOCALAPPDATA\VibePulse\Logs\torget-tokenserver.log"
 } else {
     Write-Host "  logg:    ingen beständig bakgrundslogg; kör manuellt för felsökning"
 }

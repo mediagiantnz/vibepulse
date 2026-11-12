@@ -3043,6 +3043,54 @@ class MaxTrackerDirtyWriterTests(unittest.TestCase):
         self.assertTrue(tokenserver._max_tracker_dirty)
 
 
+class ParseFilePrefilterTests(unittest.TestCase):
+    def test_skipping_rows_without_usage_keeps_every_record(self):
+        """Rows without a usage block are skipped before json.loads
+        (CLUSAGE-PERF-004); records and the resume offset must not change."""
+        now = datetime.now().astimezone()
+        month_start = now.replace(day=1, hour=0, minute=0, second=0,
+                                  microsecond=0)
+        ts = now.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        rows = [
+            {"type": "user", "timestamp": ts, "message": {"content": "hi"}},
+            {"type": "assistant", "timestamp": ts, "requestId": "r1",
+             "sessionId": "s",
+             "message": {"id": "m1", "model": "claude-opus-4-5",
+                         "usage": {"input_tokens": 10, "output_tokens": 5}}},
+            {"type": "progress", "timestamp": ts, "data": {"n": 1}},
+            {"type": "assistant", "timestamp": ts, "requestId": "r2",
+             "sessionId": "s",
+             "message": {"id": "m2", "usage": {"input_tokens": 7}}},
+        ]
+        body = "".join(json.dumps(r) + "\n" for r in rows)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "s.jsonl"
+            path.write_bytes((body + '{"partial": "usage"').encode("utf-8"))
+            records, offset = tokenserver._parse_file(path, month_start)
+        self.assertEqual([r[2] for r in records], [15, 7])
+        self.assertEqual(offset, len(body.encode("utf-8")))
+
+
+class CodexLookupTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "Windows lookup rule")
+    def test_a_codex_cmd_in_the_working_directory_is_never_chosen(self):
+        """CPython on Windows searches the cwd before PATH unless
+        NoDefaultCurrentDirectoryInExePath is set, and a scheduled task does
+        not set it (CLUSAGE-SEC-004)."""
+        old_cwd = os.getcwd()
+        env = {k: v for k, v in os.environ.items()
+               if k != "NoDefaultCurrentDirectoryInExePath"}
+        env["PATH"] = ""  # nothing on PATH: only the cwd could answer
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                mock.patch.dict(os.environ, env, clear=True):
+            Path(temp_dir, "codex.cmd").write_text("@echo off\n")
+            os.chdir(temp_dir)
+            try:
+                self.assertIsNone(tokenserver._which_not_in_cwd("codex"))
+            finally:
+                os.chdir(old_cwd)
+
+
 class MaxTrackerBackfillLoopTests(unittest.TestCase):
     def test_loop_ticks_forever_and_marks_dirty_only_on_progress(self):
         store = mock.Mock()
@@ -3074,7 +3122,9 @@ class MaxTrackerBackfillLoopTests(unittest.TestCase):
         stop_event = threading.Event()
 
         with mock.patch.object(
-                tokenserver, "MAX_TRACKER_BACKFILL_TICK_S", 0.01), \
+                tokenserver, "MAX_TRACKER_BACKFILL_TICK_S", 10.0), \
+                mock.patch.object(
+                    tokenserver, "MAX_TRACKER_BACKFILL_IDLE_TICK_S", 0.01), \
                 mock.patch.object(
                     tokenserver, "_mark_max_tracker_dirty") as dirty:
             thread = threading.Thread(
@@ -3090,7 +3140,28 @@ class MaxTrackerBackfillLoopTests(unittest.TestCase):
 
         self.assertFalse(thread.is_alive())
         self.assertGreaterEqual(store.backfill_step.call_count, 3)
-        dirty.assert_not_called()  # idle: cheap glob+stat only, never saved
+        dirty.assert_not_called()  # idle: glob+stat only, never saved
+
+    def test_an_idle_loop_backs_off_instead_of_globbing_every_half_second(self):
+        """An idle step globs and stats every log file. At the 0.5 s drain
+        cadence that kept the server at about a third of a CPU core with
+        nothing to do (2026-11-12 review, CLUSAGE-PERF-001)."""
+        store = mock.Mock()
+        store.backfill_step.side_effect = [True, False, False]
+        stop_event = mock.Mock()
+        stop_event.is_set.return_value = False
+        stop_event.wait.side_effect = [False, False, True]
+
+        with mock.patch.object(tokenserver, "_mark_max_tracker_dirty"):
+            tokenserver._run_max_tracker_backfill(store, stop_event)
+
+        waits = [call.args[0] for call in stop_event.wait.call_args_list]
+        self.assertEqual(waits, [
+            tokenserver.MAX_TRACKER_BACKFILL_TICK_S,
+            tokenserver.MAX_TRACKER_BACKFILL_IDLE_TICK_S,
+            tokenserver.MAX_TRACKER_BACKFILL_IDLE_TICK_S,
+        ])
+        self.assertGreater(tokenserver.MAX_TRACKER_BACKFILL_IDLE_TICK_S, 10)
 
 
 class MaxTrackerEndpointTests(unittest.TestCase):
