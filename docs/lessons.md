@@ -490,3 +490,22 @@ without `**_no_window_kwargs()` fails the suite instead of surfacing on
 someone's desktop weeks later. **Watch for:** `conhost.exe` in a process
 tree proving nothing - `CREATE_NO_WINDOW` still creates a console, just an
 invisible one, so verify by counting VISIBLE windows, not child processes.
+
+## 2026-11-13 · A deprecated Kconfig option shrank the LVGL pool to 64 KiB
+
+The panel booted to a black screen and dropped off WiFi. Serial showed the
+task watchdog firing every 5 s with `main` pinned on CPU 0; the backtrace
+ended in `LV_ASSERT_MALLOC` inside `lv_obj_create`, called from
+`torget_wifi_ui_create` during `app_main`, with the UI lock held, so not even
+the boot screen was flushed. The component manager had refetched
+`lvgl/lvgl` as 9.6.0 (the lock said 9.5.0; `"9.*"` allows it). In 9.6 the
+pool is sized by `CONFIG_LV_MEM_SIZE` in bytes (default 65536) and
+`CONFIG_LV_MEM_SIZE_KILOBYTES` is a deprecated leftover that nothing reads.
+`sdkconfig.defaults` set only the KiB option, and the configure-time guard
+checked only the KiB option, so it waved a 64 KiB pool through. **The
+rule:** guard the value the library actually consumes, not the one we
+happen to set. **Guards:** `torget_lvgl_effective_pool_kib()` prefers the
+byte option when it exists; `test_lvgl_memory_config.py` pins the exact
+65536/256 case; `sdkconfig.defaults` sets both. **Watch for:** any other
+`*_KILOBYTES` or renamed option after an LVGL or IDF component bump, and
+`managed_components/` disagreeing with `dependencies.lock`.
