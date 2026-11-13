@@ -2,8 +2,8 @@
 """Regression guard: the OTA pusher's sender gates must never erode.
 
 Läxorna 2026-08-14: en hårdkodad byggkatalog och ett filval vid skriptstart
-sköt en arkiverad frysbinär till glaset; -dirty-byggen och byggen utan grön
-CI ska aldrig kunna levereras av misstag. Enheten bevisar att en avbild är
+sköt en arkiverad frysbinär till glaset; -dirty-byggen och byggen utan en
+full ./test/run.sh-körning ska aldrig kunna levereras av misstag. Enheten bevisar att en avbild är
 GILTIG — skriptet bevisar att den är RÄTT."""
 
 import hashlib
@@ -74,15 +74,20 @@ assert 'BIN_VERSION=$(dd if="$BIN" bs=1 skip=48 count=32' in script, (
 assert "TG_OTA_ALLOW_DIRTY" in script and "*-dirty*" in script, (
     "-dirty-byggen ska vägras utan uttrycklig TG_OTA_ALLOW_DIRTY=1"
 )
-assert "TG_OTA_ALLOW_NO_CI" in script and "gh run list --commit" in script, (
-    "CI-bryggan: byggen utan grön CI för sin commit ska vägras, med "
-    "TG_OTA_ALLOW_NO_CI=1 som enda nödventil"
+# --- The gate bridge ----------------------------------------------------------
+# GitHub Actions does not run for this fork (2026-11-13), so the bridge
+# checks the stamp ./test/run.sh writes after a full pass on a clean tree.
+assert "TG_OTA_ALLOW_NO_GATE" in script and "vibepulse-gate/$BIN_COMMIT" in script, (
+    "the gate bridge: builds whose commit has no full run.sh pass are "
+    "refused, with TG_OTA_ALLOW_NO_GATE=1 as the only override"
 )
-
-ci = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-assert "branches: ['**']" in ci, (
-    "CI ska köra på alla brancher — annars kan bryggan aldrig se grönt "
-    "för branchbyggen och blockerar det dagliga flödet"
+assert "gh run list" not in script, (
+    "the bridge must not wait on GitHub CI, which never runs for this fork"
 )
+runner = (root / "test" / "run.sh").read_text(encoding="utf-8")
+assert "vibepulse-gate" in runner and "git diff --quiet HEAD" in runner, (
+    "run.sh must write the stamp the bridge checks, and only for a clean tree"
+)
+assert 'GATE_SKIPPED=1' in runner, "a skipped lane must never write a stamp"
 
-print("OK: avsändargrindarna står — rätt fil, deklarerad version, ren build, grön CI")
+print("OK: the sender gates hold - right file, declared version, clean build, gate passed")

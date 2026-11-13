@@ -19,7 +19,6 @@ tokenserver = read("tools/tokenserver/README.md")
 setup = read("docs/agent-setup.md")
 secrets_example = read("secrets.h.example")
 runner = read("test/run.sh")
-workflow = read(".github/workflows/ci.yml")
 all_guides = "\n".join((readme, interaction, worker, tokenserver, setup))
 interaction_words = " ".join(interaction.split()).lower()
 
@@ -96,15 +95,13 @@ for test_name in (
     assert test_name in runner
 assert "tools/interaction-relay" in runner
 assert "npm ci" in runner and "npm test" in runner and "npm run typecheck" in runner
-assert "node-version: 24" in workflow
-assert "tools/interaction-relay" in workflow
-assert "requirements-interaction-relay.txt" in workflow
-for runner in ("ubuntu-latest", "macos-latest", "windows-latest"):
-    assert runner in workflow, f"tokenserver CI is missing {runner}"
-# The module list CI runs lives in test/tokenserver-suite.txt, shared with
-# test/run.sh — assert the modules there, and that CI consumes the list.
-assert "test/tokenserver-suite.txt" in workflow, (
-    "tokenserver CI must consume the shared suite list"
+# GitHub Actions does not run for this fork: test/run.sh is the only gate,
+# so it must check the relay dependency, run the Codex plugin suite and
+# consume the shared tokenserver module list.
+assert "requirements-interaction-relay.txt" in runner
+assert "test_vibepulse_codex_plugin.py" in runner
+assert "test/tokenserver-suite.txt" in runner, (
+    "the gate must consume the shared suite list"
 )
 suite = read("test/tokenserver-suite.txt")
 for module in (
@@ -113,7 +110,7 @@ for module in (
     "test_interaction_relay_crypto",
 ):
     assert f"tools.tokenserver.{module}" in suite, (
-        f"tokenserver CI is missing {module} from the host contract"
+        f"the tokenserver suite is missing {module} from the host contract"
     )
 
 print("OK: encrypted interaction relay setup and privacy are documented")

@@ -29,7 +29,7 @@ backlog IDs in parentheses track closing them.
 | 3 | `GET /` diagnostic endpoint | `http://<mac>:8737/`, live state | process lifetime |
 | 4 | Server state files | `~/Library/Application Support/VibePulse/` | durable (8 d / 400 d retention) |
 | 5 | The screen itself | dashes, `STALE`, `NO DATA` | live only |
-| 6 | CI logs | GitHub Actions | per-run |
+| 6 | Gate output | `./test/run.sh` console, stamps in `.git/vibepulse-gate/` | per-run |
 | 7 | Windows tray logs | `%LOCALAPPDATA%\VibePulse\tray.log` and `Logs\torget-tokenserver.log` | durable; tray.log rotates past 512 KB, the server log self-rotates at ~5 MB |
 
 Fastest health check: the **smoke test** automates comb steps 1–4 in one
@@ -241,17 +241,16 @@ the max-tracker or agent-status feed dies while `/api/tokens` keeps
 succeeding, their pages keep reading as live (OBS-09). Until fixed, a
 "LIVE" header is not proof for those two feeds.
 
-### 6. CI logs
+### 6. Gate output
 
-GitHub Actions, four jobs: a `host-gate` job that runs the same
-`./test/run.sh` as the bench (C test binaries, visual landmarks under
-xvfb, crypto vectors, hardware registries, skill contracts, the
-tokenserver suite), the jobs covering the JS suites it skips via
-`--skip-js` (the npm-cached interaction-relay job runs the Worker suite;
-the tokenserver matrix job runs the relay mailbox one), and an ESP-IDF
-firmware build. Since OBS-24 closed (2026-08-21), red
-`./test/run.sh` means red CI too — the remaining gap is only
-platform-shaped (CI is Linux; macOS-only quirks still need the bench).
+There is no GitHub CI: GitHub Actions does not run for this fork, so
+`./test/run.sh` on your own machine is the whole gate (C test binaries,
+visual landmarks, crypto vectors, hardware registries, skill contracts,
+the tokenserver suite, both relay Node suites, and the ESP-IDF build in
+`test/firmware-check.sh` when `idf.py` is on PATH). Its console output is
+the only log. The last line says whether a gate stamp was written; the
+stamps live in `.git/vibepulse-gate/<sha>`. It only covers the platform
+you ran it on.
 
 ## Known bad signatures
 

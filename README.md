@@ -1,7 +1,5 @@
 # VibePulse
 
-[![CI](https://github.com/niclasvestlund-YT/vibepulse/actions/workflows/ci.yml/badge.svg)](https://github.com/niclasvestlund-YT/vibepulse/actions/workflows/ci.yml)
-
 ![VibePulse: quota, a NEEDS YOU alert, and the Max Tracker heatmap](docs/img/hero.png)
 
 **A little always-on screen for your shelf that shows what your AI coding
@@ -628,6 +626,12 @@ python -m pip install -r requirements-dev.txt
 
 Python 3.11+ is required. The script uses the activated environment's Python
 by default; set `PYTHON_BIN` to point at a different 3.11+ interpreter.
+
+There is no GitHub CI: `./test/run.sh` is the whole gate, so run it before
+you push. It also runs the relay Node suites (needs Node and npm) and, when
+`idf.py` is on PATH, a firmware build with the optional GitHub path switched
+on (`test/firmware-check.sh`). A full pass on a clean commit writes the stamp
+that `tools/ota-flash.sh` requires before it sends that build.
 
 ## FAQ
 
