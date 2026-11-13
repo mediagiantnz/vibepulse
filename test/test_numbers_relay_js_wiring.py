@@ -5,8 +5,6 @@ import json
 from pathlib import Path
 import unittest
 
-import yaml
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -16,118 +14,39 @@ def read(relative: str) -> str:
 
 
 class NumbersRelayJsWiringTests(unittest.TestCase):
+    """GitHub Actions does not run for this fork, so ./test/run.sh is the
+    only gate: every relay suite and the dry build must live in it, once."""
+
     def setUp(self) -> None:
         self.runner = read("test/run.sh")
-        workflow = yaml.safe_load(read(".github/workflows/ci.yml"))
-        self.jobs = workflow["jobs"]
-
-    @staticmethod
-    def step_runs(job: dict) -> list[str]:
-        return [
-            step["run"]
-            for step in job["steps"]
-            if isinstance(step, dict) and "run" in step
-        ]
+        self.node_branch = self.runner.split(
+            "elif command -v node >/dev/null 2>&1 && "
+            "command -v npm >/dev/null 2>&1; then",
+            1,
+        )[1].split("\nelse\n", 1)[0]
 
     def test_full_runner_runs_each_numbers_relay_suite_once(self) -> None:
         merge_command = "node --test tools/relay/test.mjs"
         runtime_command = "(cd tools/relay && npm ci && npm test)"
+        dry_build_command = "(cd tools/relay && npm run build:dry)"
 
-        self.assertEqual(self.runner.count(merge_command), 1)
-        self.assertEqual(self.runner.count(runtime_command), 1)
+        for command in (merge_command, runtime_command, dry_build_command):
+            self.assertEqual(self.runner.count(command), 1, command)
+            self.assertIn(command, self.node_branch)
         self.assertEqual(
             self.runner.count(
                 '"$PYTHON_BIN" test_numbers_relay_js_wiring.py'
             ),
             1,
         )
-
-        node_branch = self.runner.split(
-            "elif command -v node >/dev/null 2>&1 && "
-            "command -v npm >/dev/null 2>&1; then",
-            1,
-        )[1].split('elif [ -n "${CI:-}" ]; then', 1)[0]
-        self.assertIn(merge_command, node_branch)
-        self.assertIn(runtime_command, node_branch)
         self.assertIn('if [ "$SKIP_JS" = 1 ]; then', self.runner)
 
-    def test_ci_owns_relay_suites_in_one_non_matrix_job(self) -> None:
-        merge_command = "node --test tools/relay/test.mjs"
-        runtime_command = "(cd tools/relay && npm ci && npm test)"
-        dry_build_command = "(cd tools/relay && npm run build:dry)"
-
-        self.assertIn("numbers-relay", self.jobs)
-        numbers_job = self.jobs["numbers-relay"]
-        self.assertEqual(numbers_job["runs-on"], "ubuntu-latest")
-        self.assertNotIn("strategy", numbers_job)
-
-        runs = self.step_runs(numbers_job)
-        self.assertEqual(runs.count(merge_command), 1)
-        self.assertEqual(runs.count(runtime_command), 1)
-        self.assertEqual(runs.count(dry_build_command), 1)
-
-        merge_owners = [
-            name
-            for name, job in self.jobs.items()
-            if merge_command in self.step_runs(job)
-        ]
-        runtime_owners = [
-            name
-            for name, job in self.jobs.items()
-            if runtime_command in self.step_runs(job)
-        ]
-        self.assertEqual(merge_owners, ["numbers-relay"])
-        self.assertEqual(runtime_owners, ["numbers-relay"])
-
-        setup_node = [
-            step
-            for step in numbers_job["steps"]
-            if step.get("uses") == "actions/setup-node@v4"
-        ]
-        self.assertEqual(len(setup_node), 1)
-        self.assertEqual(setup_node[0]["with"]["node-version"], 22)
-        self.assertEqual(setup_node[0]["with"]["cache"], "npm")
-        self.assertEqual(
-            setup_node[0]["with"]["cache-dependency-path"],
-            "tools/relay/package-lock.json",
-        )
-
-    def test_host_gate_skips_javascript_suites(self) -> None:
-        host_gate_runs = self.step_runs(self.jobs["host-gate"])
-        run_sh_commands = [
-            command.strip()
-            for command in host_gate_runs
-            if "./test/run.sh" in command
-        ]
-
-        self.assertEqual(
-            run_sh_commands,
-            ["xvfb-run -a ./test/run.sh --skip-js"],
-        )
-        self.assertFalse(
-            any(
-                "node --test tools/relay/test.mjs" in command
-                or "npm test" in command
-                for command in host_gate_runs
-            )
-        )
-
-    def test_tokenserver_matrix_does_not_run_numbers_relay_suites(self) -> None:
-        tokenserver_job = self.jobs["tokenserver"]
-
-        self.assertIn("matrix", tokenserver_job["strategy"])
-        self.assertFalse(
-            any(
-                step.get("uses") == "actions/setup-node@v4"
-                for step in tokenserver_job["steps"]
-            )
-        )
-        self.assertFalse(
-            any(
-                "tools/relay" in run or "npm test" in run
-                for run in self.step_runs(tokenserver_job)
-            )
-        )
+    def test_skipped_node_lane_never_writes_a_gate_stamp(self) -> None:
+        js_block = self.runner.split('if [ "$SKIP_JS" = 1 ]; then', 1)[1]
+        js_block = js_block.split("\nfi\n", 1)[0]
+        skip_branch, rest = js_block.split("elif command -v node", 1)
+        self.assertIn("GATE_SKIPPED=1", skip_branch)
+        self.assertIn("GATE_SKIPPED=1", rest.split("\nelse\n", 1)[1])
 
     def test_npm_runtime_suite_does_not_repeat_merge_suite(self) -> None:
         package = json.loads(read("tools/relay/package.json"))

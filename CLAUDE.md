@@ -1,5 +1,8 @@
 Read `README.md` for the repository structure and build workflow.
 
+There is no GitHub CI (Actions does not run for this fork). Run
+`./test/run.sh` yourself before every push; nothing else checks main.
+
 Setting this repo up for someone (secrets, build, flash, tokenserver)? Follow
 `docs/agent-setup.md` - step-by-step, with verifications and a symptom→fix
 table. Never flash the board without the user explicitly asking you to.
@@ -14,8 +17,9 @@ OTA. Non-negotiables: the maintenance window opens ONLY from the device (a
 window instead, see `docs/wifi.md` - or the UPDATE pill on the takeover) -
 never claim or imply a
 script can; the sender gates (newest-binary-at-send, version printed,
--dirty refused) exist because a stale archived build once froze the panel -
-never bypass them with TG_OTA_ALLOW_DIRTY without the user saying so; and
+-dirty refused, `./test/run.sh` stamp for the commit) exist because a stale
+archived build once froze the panel - never bypass them with
+TG_OTA_ALLOW_DIRTY or TG_OTA_ALLOW_NO_GATE without the user saying so; and
 after editing `tools/tokenserver/`, restart the launchd service
 (`launchctl kickstart -k gui/$(id -u)/se.torget.tokenserver`) - the running
 process keeps old code and the panel honestly shows the gap.

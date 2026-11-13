@@ -151,13 +151,16 @@ The device proves an image is *valid*; the pusher proves it is the
 2. **The embedded version is read from the image and announced** before
    anything is sent.
 3. **`-dirty` builds are refused** (`TG_OTA_ALLOW_DIRTY=1` to override).
-4. **CI bridge**: the commit in the version string must have a green CI
-   run on GitHub (`TG_OTA_ALLOW_NO_CI=1` for offline emergencies). CI
-   runs on every pushed branch for exactly this reason.
+4. **Gate bridge**: the commit in the version string must have passed the
+   full `./test/run.sh` on a clean tree, which writes a per-commit stamp
+   under the git directory (`TG_OTA_ALLOW_NO_GATE=1` to override). GitHub
+   Actions does not run for this fork, so this local stamp replaced the old
+   green-CI check on 2026-11-13.
 
 ## Day-to-day developer workflow
 
 ```
+./test/run.sh                       # the gate; stamps HEAD on a full pass
 idf.py build                        # or idf.py -B <dir> build
 tools/ota-flash.sh                  # waits for consent, then uploads
 ```

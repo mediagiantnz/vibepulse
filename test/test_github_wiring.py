@@ -105,13 +105,17 @@ class GitHubWiringTests(unittest.TestCase):
         self.assertNotIn("esp_codec", chime)
         self.assertNotIn("i2s_", chime)
 
-    def test_ci_compiles_the_default_off_optional_path(self):
-        workflow = read(".github/workflows/ci.yml")
-        self.assertIn("TK_GITHUB_SCREEN_ENABLED 1", workflow)
-        self.assertIn("TK_GITHUB_NOTIFICATIONS_ENABLED 1", workflow)
-        self.assertIn("TK_GITHUB_SOUND_ENABLED 1", workflow)
-        # CI's tokenserver module list lives in the shared suite file.
-        self.assertIn("test/tokenserver-suite.txt", workflow)
+    def test_gate_compiles_the_default_off_optional_path(self):
+        # GitHub Actions does not run for this fork; the local gate builds
+        # the firmware with the optional GitHub path switched on.
+        check = read("test/firmware-check.sh")
+        runner = read("test/run.sh")
+        self.assertIn("TK_GITHUB_SCREEN_ENABLED 1", check)
+        self.assertIn("TK_GITHUB_NOTIFICATIONS_ENABLED 1", check)
+        self.assertIn("TK_GITHUB_SOUND_ENABLED 1", check)
+        self.assertIn("sh test/firmware-check.sh", runner)
+        # The gate's tokenserver module list lives in the shared suite file.
+        self.assertIn("test/tokenserver-suite.txt", runner)
         self.assertIn("tools.tokenserver.test_github_monitor",
                       read("test/tokenserver-suite.txt"))
 

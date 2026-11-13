@@ -2,20 +2,34 @@
 # Hosttesterna för Torgets rena kärnor. Kräver en C-kompilator (clang via
 # Xcode CLT, eller gcc) samt Python 3.11+ med PyYAML 6.0.3 och Pillow 12.3.0.
 #
-# Flaggor:
-#   --skip-js  hoppa över Node-lanen (relay + interaction-relay). Enbart för
-#              CI:s host-gate-jobb — CI kör dem i egna jobb (Worker-sviten
-#              npm-cachad). Lokalt körs hela grinden flagglöst: ./test/run.sh
+# This is the whole repository gate. GitHub Actions does not run for this
+# fork, so nothing else checks a commit: run ./test/run.sh before pushing
+# and before an OTA push. A full pass on a clean tree writes a stamp for
+# HEAD that tools/ota-flash.sh requires before it sends that build.
+#
+# Flags (each skips a lane, and a skipped lane means no stamp):
+#   --skip-js        skip the Node lane (numbers relay + interaction relay)
+#   --skip-firmware  skip the ESP-IDF build check (test/firmware-check.sh)
 set -e
 cd "$(dirname "$0")"
 
 SKIP_JS=0
+SKIP_FIRMWARE=0
+GATE_SKIPPED=0
 for arg in "$@"; do
   case "$arg" in
     --skip-js) SKIP_JS=1 ;;
-    *) echo "Okänd flagga: $arg (känd: --skip-js)" >&2; exit 2 ;;
+    --skip-firmware) SKIP_FIRMWARE=1 ;;
+    *) echo "Unknown flag: $arg (known: --skip-js, --skip-firmware)" >&2; exit 2 ;;
   esac
 done
+
+# The stamp is only honest for a committed tree: remember HEAD now, and
+# only if nothing tracked is modified.
+GATE_SHA=""
+if git diff --quiet HEAD 2>/dev/null; then
+  GATE_SHA=$(git rev-parse HEAD 2>/dev/null || true)
+fi
 
 PYTHON_BIN=${PYTHON_BIN:-python3}
 if ! "$PYTHON_BIN" -c \
@@ -294,9 +308,9 @@ cd ..
 "$PYTHON_BIN" test/test_token_body_capacity.py
 "$PYTHON_BIN" test/test_agent_status_body_capacity.py
 "$PYTHON_BIN" -m unittest tools.test_hardware_registry -v
-# Tokenservermodulerna listas i test/tokenserver-suite.txt — EN lista,
-# delad med CI:s tokenserverjobb (PR #11-läxan: två listor gled isär och
-# grön CI dolde en NameError). Vakten: varje test_*.py i tools/tokenserver/
+# Tokenservermodulerna listas i test/tokenserver-suite.txt — EN lista
+# (PR #11-läxan: två listor gled isär och ett grönt resultat dolde en
+# NameError). Vakten: varje test_*.py i tools/tokenserver/
 # måste stå i listan, så en ny modul inte tyst kan hamna utanför grinden.
 for suite_file in tools/tokenserver/test_*.py; do
   suite_module="tools.tokenserver.$(basename "$suite_file" .py)"
@@ -308,17 +322,41 @@ done
 "$PYTHON_BIN" -m unittest \
   $(tr -d '\r' < test/tokenserver-suite.txt | grep -v '^#') -v
 
-# Båda molntjänsterna hålls av Node. CI måste ha Node 22; en lokal
-# firmwareutvecklare utan Node får ett ärligt hopp i stället för falskt grönt.
+# Both cloud services run on Node. Without Node the lane is skipped
+# honestly (and no stamp is written) instead of reporting a false pass.
 if [ "$SKIP_JS" = 1 ]; then
-  echo "OBS: --skip-js — relayernas JS-tester körs i CI:s egna jobb"
+  echo "NOTE: --skip-js, the relay JS suites did not run"
+  GATE_SKIPPED=1
 elif command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
   node --test tools/relay/test.mjs
   (cd tools/relay && npm ci && npm test)
+  (cd tools/relay && npm run build:dry)
   (cd tools/interaction-relay && npm ci && npm test && npm run typecheck)
-elif [ -n "${CI:-}" ]; then
-  echo "ERROR: CI requires Node.js 22 + npm for both relay security services" >&2
-  exit 1
 else
-  echo "OBS: node/npm saknas — relayernas JS-tester hoppas över lokalt (CI kör dem)"
+  echo "NOTE: node/npm missing, the relay JS suites did not run"
+  GATE_SKIPPED=1
+fi
+
+# The ESP-IDF build with the default-off GitHub path switched on.
+if [ "$SKIP_FIRMWARE" = 1 ]; then
+  echo "NOTE: --skip-firmware, the firmware build check did not run"
+  GATE_SKIPPED=1
+elif command -v idf.py >/dev/null 2>&1; then
+  sh test/firmware-check.sh
+else
+  echo "NOTE: idf.py not on PATH, the firmware build check did not run"
+  GATE_SKIPPED=1
+fi
+
+# The gate stamp that tools/ota-flash.sh checks: every lane ran, and the
+# tree was clean on the same commit at the start and at the end.
+if [ "$GATE_SKIPPED" = 0 ] && [ -n "$GATE_SHA" ] \
+  && [ "$GATE_SHA" = "$(git rev-parse HEAD 2>/dev/null || true)" ] \
+  && git diff --quiet HEAD 2>/dev/null; then
+  GATE_DIR="$(git rev-parse --path-format=absolute --git-common-dir)/vibepulse-gate"
+  mkdir -p "$GATE_DIR"
+  date -u '+%Y-%m-%dT%H:%M:%SZ' > "$GATE_DIR/$GATE_SHA"
+  echo "GATE PASSED for $GATE_SHA (stamp written for tools/ota-flash.sh)"
+else
+  echo "Tests passed, but no gate stamp was written (a lane was skipped, or the tree was not a clean commit)"
 fi

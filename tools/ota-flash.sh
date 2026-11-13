@@ -90,41 +90,35 @@ case "$BIN_VERSION" in
     ;;
 esac
 
-# CI-BRYGGAN (beställd 2026-08-14, samma kväll som spökbinären): bara
-# byggen vars commit har GRÖN CI får gå till glaset. Hashen tas ur
-# versionssträngen (gXXXXXXX); en taggad version löses via git. Kräver
-# nät + gh — offline-nödfall övermanas med TG_OTA_ALLOW_NO_CI=1.
-if [ "${TG_OTA_ALLOW_NO_CI:-0}" != "1" ]; then
+# THE GATE BRIDGE (first ordered 2026-08-14, the night of the ghost
+# binary; moved off GitHub CI 2026-11-13 because GitHub Actions does not
+# run for this fork): only builds whose commit passed the full
+# ./test/run.sh on a clean tree may go to the glass. run.sh writes a stamp
+# per commit under the git dir; this checks it. The hash comes from the
+# version string (gXXXXXXX); a tagged version is resolved through git.
+# Override with TG_OTA_ALLOW_NO_GATE=1 (the old TG_OTA_ALLOW_NO_CI=1 still
+# works) only when the user says so.
+if [ "${TG_OTA_ALLOW_NO_GATE:-${TG_OTA_ALLOW_NO_CI:-0}}" != "1" ]; then
   case "$BIN_VERSION" in
     *-g*) BIN_COMMIT=${BIN_VERSION##*-g} ;;
     *)    BIN_COMMIT=$(git rev-parse --short "$BIN_VERSION" 2>/dev/null || true) ;;
   esac
-  # gh:s --commit kräver FULL sha (kort hash ger tyst tom lista — mätt
-  # 2026-08-14); rev-parse expanderar och bevisar samtidigt att committen
-  # finns i det här trädet — en främmande binär vägras på köpet.
-  BIN_COMMIT=$(git rev-parse "${BIN_COMMIT:-INGEN}" 2>/dev/null || true)
+  # The stamp is named by the FULL sha; rev-parse expands the short hash
+  # and also proves the commit exists in this tree, so a foreign binary
+  # is refused as well.
+  BIN_COMMIT=$(git rev-parse "${BIN_COMMIT:-NONE}" 2>/dev/null || true)
   if [ -z "${BIN_COMMIT:-}" ]; then
-    echo "VÄGRAR: kan inte utläsa commit ur '$BIN_VERSION' — CI går inte att bevisa." >&2
-    echo "        TG_OTA_ALLOW_NO_CI=1 om du menar det." >&2
+    echo "REFUSING: cannot read a commit from '$BIN_VERSION', so the gate cannot be proven." >&2
+    echo "        TG_OTA_ALLOW_NO_GATE=1 if you mean it." >&2
     exit 1
   fi
-  CI_GREEN=$(gh run list --commit "$BIN_COMMIT" --status success     --json databaseId --jq length 2>/dev/null || echo X)
-  if [ "$CI_GREEN" = "X" ]; then
-    echo "VÄGRAR: kan inte fråga GitHub om CI för $BIN_COMMIT (offline? gh?)." >&2
-    echo "        TG_OTA_ALLOW_NO_CI=1 om du menar det." >&2
+  GATE_STAMP="$(git rev-parse --path-format=absolute --git-common-dir)/vibepulse-gate/$BIN_COMMIT"
+  if [ ! -f "$GATE_STAMP" ]; then
+    echo "REFUSING: ./test/run.sh has not passed in full for $BIN_COMMIT on a clean tree." >&2
+    echo "        Run ./test/run.sh on that commit first, or TG_OTA_ALLOW_NO_GATE=1 if you mean it." >&2
     exit 1
   fi
-  if [ "${CI_GREEN:-0}" -lt 1 ]; then
-    CI_PENDING=$(gh run list --commit "$BIN_COMMIT" --json status       --jq '[.[]|select(.status!="completed")]|length' 2>/dev/null || echo 0)
-    if [ "${CI_PENDING:-0}" -ge 1 ]; then
-      echo "VÄGRAR: CI för $BIN_COMMIT kör fortfarande — vänta på grönt." >&2
-    else
-      echo "VÄGRAR: ingen grön CI för $BIN_COMMIT (opushad? röd?)." >&2
-    fi
-    echo "        TG_OTA_ALLOW_NO_CI=1 om du menar det." >&2
-    exit 1
-  fi
-  echo "CI grön för $BIN_COMMIT ($CI_GREEN körning(ar))"
+  echo "gate passed for $BIN_COMMIT ($(cat "$GATE_STAMP"))"
 fi
 
 # Uppladdningsbeviset: HMAC-SHA256 med token (dess 64 ASCII-tecken) som

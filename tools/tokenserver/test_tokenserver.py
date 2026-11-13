@@ -3602,7 +3602,7 @@ class ArgumentParsingTests(unittest.TestCase):
 class RepositoryRunnerTests(unittest.TestCase):
     def test_default_runner_includes_config_and_codex_route_suites_once(self):
         # The module list lives in test/tokenserver-suite.txt (one line per
-        # module), shared by test/run.sh and CI so the two can never drift.
+        # module), read by test/run.sh, the only gate (no GitHub CI).
         root = Path(__file__).resolve().parents[2]
         suite = (root / "test" / "tokenserver-suite.txt").read_text(
             encoding="utf-8")
